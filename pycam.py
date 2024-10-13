@@ -6,7 +6,8 @@ import meshlib.mrmeshpy as mm
 import meshlib.mrmeshnumpy as mn
 import math
 import sys
-from manifold3d import Manifold
+from manifold3d import Manifold, set_circular_segments
+set_circular_segments(32)
 
 mm.FixSelfIntersectionMethod
 def loadobj(filename):
@@ -16,15 +17,15 @@ def loadobj(filename):
 
 def generate_bit(type, diameter, length=50e-3):
     if type == "endmill":
-        return Manifold.cylinder(length, diameter/2, circular_segments=32)
+        return Manifold.cylinder(length, diameter/2)
     elif type == "ballnose":
-        shaft = Manifold.cylinder(length-diameter/2, diameter/2, circular_segments=32)
-        bit = Manifold.sphere(diameter/2, circular_segments=32)
+        shaft = Manifold.cylinder(length-diameter/2, diameter/2)
+        bit = Manifold.sphere(diameter/2)
         return shaft + bit
     elif type == "drill":
-        shaft = Manifold.cylinder(length-diameter/2, diameter/2, circular_segments=32)
         conelen = 0.5*diameter/math.tan(math.radians(59))
-        bit = Manifold.cylinder(conelen, diameter/2, 0).rotate(np.array([90, 0, 0]), circular_segments=32)
+        shaft = Manifold.cylinder(length-conelen, diameter/2)
+        bit = Manifold.cylinder(conelen, diameter/2, 0).rotate(np.array([180, 0, 0]))
         return shaft + bit
 
 class State:
@@ -127,6 +128,8 @@ class LinearInterpolate(Operation):
     def __init__(self, state, to, axesmask, n=30):
         self.to = to
         self.axesmask = axesmask
+        if np.linalg.norm((state.loc-to)[:2],ord=2) < 1e-8:
+            n = 1
         self.n = n
         super().__init__(state)
 
