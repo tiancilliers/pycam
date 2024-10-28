@@ -6,27 +6,79 @@ import meshlib.mrmeshpy as mm
 import meshlib.mrmeshnumpy as mn
 import math
 import sys
-from manifold3d import Manifold, set_circular_segments
+from copy import deepcopy
+from manifold3d import Manifold, set_circular_segments, CrossSection, Mesh
 set_circular_segments(32)
 
-mm.FixSelfIntersectionMethod
+Manifold.__deepcopy__ = lambda self, memo: Manifold.compose([self])
+
 def loadobj(filename):
     model = mm.loadMesh(filename)
     model.transform(mm.AffineXf3f.translation(-model.getBoundingBox().center()))
-    return model
+    mesh = Mesh(vert_properties = mn.getNumpyVerts(model), tri_verts = mn.getNumpyFaces(model.topology))   
+    return Manifold(mesh)
 
-def generate_bit(type, diameter, length=50e-3):
-    if type == "endmill":
-        return Manifold.cylinder(length, diameter/2)
-    elif type == "ballnose":
-        shaft = Manifold.cylinder(length-diameter/2, diameter/2)
-        bit = Manifold.sphere(diameter/2)
-        return shaft + bit
-    elif type == "drill":
-        conelen = 0.5*diameter/math.tan(math.radians(59))
-        shaft = Manifold.cylinder(length-conelen, diameter/2)
-        bit = Manifold.cylinder(conelen, diameter/2, 0).rotate(np.array([180, 0, 0]))
-        return shaft + bit
+
+class Tool:
+    def __init__(self, type, diameter, length=50e-3):
+        self.type = type
+        self.diameter = diameter
+        self.length = length
+    
+    def generate_bit(self, loc):
+        if self.type == "endmill":
+            return Manifold.cylinder(self.length, self.diameter/2).translate(loc)
+        elif self.type == "ballnose":
+            shaft = Manifold.cylinder(self.length-self.diameter/2, self.diameter/2)
+            bit = Manifold.sphere(self.diameter/2)
+            return (shaft + bit).translate([0,0,self.diameter/2]).translate(loc)
+        elif self.type == "drill":
+            conelen = 0.5*self.diameter/math.tan(math.radians(59))
+            shaft = Manifold.cylinder(self.length-conelen, self.diameter/2)
+            bit = Manifold.cylinder(conelen, self.diameter/2, 0).rotate(np.array([180, 0, 0])).translate(conelen)
+            return (shaft + bit).translate(loc)
+        
+    def generate_linear_cutarea(self, loc1, loc2):
+        delta = loc2 - loc1
+        dcyl = 0 if self.type == "endmill" else (0.5*self.diameter if self.type == "ballnose" else 0.5*self.diameter/math.tan(math.radians(59)))
+        
+        dxy = (delta[0]**2 + delta[1]**2)**0.5
+        dxyz = (delta[0]**2 + delta[1]**2 + delta[2]**2)**0.5
+        phi = math.atan2(delta[0], delta[1])+np.pi
+        theta = math.atan2(dxy, delta[2])
+
+        cutarea = Manifold()
+        if dxy > 1e-9:
+            rectrod = CrossSection.square([self.diameter, (self.length-dcyl)*np.sin(theta)]).translate([-0.5*self.diameter, 0])
+            cutarea += Manifold.extrude(rectrod, dxyz)\
+                .warp(lambda v: [v[0], v[1], v[2]+v[1]/math.tan(theta)])\
+                .rotate(np.array([np.rad2deg(theta), 0, 0]))\
+                .translate([0,0,dcyl])
+        if abs(delta[2]) > 1e-9:
+            circ = CrossSection.circle(0.5*self.diameter)
+            cutarea += Manifold.extrude(circ, 1).scale([1,1,delta[2]])\
+                .warp(lambda v: [v[0], v[1]-v[2]*math.tan(theta), v[2]])\
+                .translate([0,0,dcyl])
+        cutarea += Manifold.cylinder(self.length-dcyl, 0.5*self.diameter).rotate([0, 0, np.degrees(phi)]).translate([0,0,dcyl])
+        cutarea += Manifold.cylinder(self.length-dcyl, 0.5*self.diameter).rotate([0, 0, np.degrees(phi)]).translate([0,-dxy,delta[2]+dcyl])
+        if self.type == "ballnose":
+            circ = CrossSection.circle(0.5*self.diameter)
+            cutarea += Manifold.extrude(circ, dxyz)\
+                .rotate(np.array([np.rad2deg(theta), 0, 0]))\
+                .translate([0,0,dcyl])
+            if dxy > 1e-9:
+                cutarea += Manifold.revolve(circ, circular_segments=int(16*(np.pi-theta)/np.pi)+1, revolve_degrees=np.degrees(np.pi-theta))\
+                    .rotate(np.array([-90, 0., 90]))\
+                    .translate([0,0,dcyl])
+                cutarea += Manifold.revolve(circ, circular_segments=int(16*(theta)/np.pi)+1, revolve_degrees=np.degrees(theta))\
+                    .rotate(np.array([-90, 0., -90]))\
+                    .translate([0,-dxy,dcyl+delta[2]])
+            else:
+                cutarea += Manifold.sphere(0.5*self.diameter).translate([0,0,dcyl])
+
+        cutarea = cutarea.rotate(np.array([0, 0, -np.rad2deg(phi)])).translate(loc1)
+
+        return cutarea
 
 class State:
     def __init__(self, model, material, tool, zero, loc):
@@ -39,7 +91,7 @@ class State:
     def generate(filename, blank_size):
         model = loadobj(model_file)
         material = Manifold.cube(blank_size, True)
-        tool = generate_bit("endmill", 4e-3)
+        tool = Tool("endmill", 4e-3)
         return State(model, material, tool, np.array([0,0,0]), np.array([0,0,0]))
 
     def init_polyscope(self, axis_scale=0.1):
@@ -58,14 +110,14 @@ class State:
         ps.set_user_callback(polyscope_callback)
         ps.look_at([axis_scale, -axis_scale, axis_scale], [0, 0, 0], 1)
 
-        ps.register_surface_mesh("model", mn.getNumpyVerts(self.model), mn.getNumpyFaces(self.model.topology))
-        ps.register_surface_mesh("tool", self.tool.to_mesh().vert_properties[:, :3], self.tool.to_mesh().tri_verts).set_transparency(0.5)
+        ps.register_surface_mesh("model", self.model.to_mesh().vert_properties[:, :3], self.model.to_mesh().tri_verts)
+        ps.register_surface_mesh("tool", self.tool.generate_bit(self.loc).to_mesh().vert_properties[:, :3], self.tool.generate_bit(self.loc).to_mesh().tri_verts).set_transparency(0.5)
         ps.register_surface_mesh("diff", self.material.to_mesh().vert_properties[:, :3], self.material.to_mesh().tri_verts).set_transparency(0.5)
         ps.show()
 
     def refresh_polyscape(self):
-        ps.register_surface_mesh("model", mn.getNumpyVerts(self.model), mn.getNumpyFaces(self.model.topology))
-        ps.register_surface_mesh("tool", self.tool.to_mesh().vert_properties[:, :3], self.tool.to_mesh().tri_verts).set_transparency(0.5)
+        ps.register_surface_mesh("model", self.model.to_mesh().vert_properties[:, :3], self.model.to_mesh().tri_verts)
+        ps.register_surface_mesh("tool", self.tool.generate_bit(self.loc).to_mesh().vert_properties[:, :3], self.tool.generate_bit(self.loc).to_mesh().tri_verts).set_transparency(0.5)
         ps.register_surface_mesh("diff", self.material.to_mesh().vert_properties[:, :3], self.material.to_mesh().tri_verts).set_transparency(0.5)
 
 class Operation:
@@ -74,18 +126,17 @@ class Operation:
         self.started = False
 
     def __iter__(self):
-        self.prevState = State(mm.copyMesh(state.model), Manifold.compose([state.material]), Manifold.compose([state.tool]), [v for v in state.zero], [v for v in state.loc])
+        self.prevState = deepcopy(self.state)
         self.started = True
         self.done = False
         return self
 
     def restore(self):
-        self.state.model = self.prevState.model
-        self.state.material = self.prevState.material
-        self.state.tool = self.prevState.tool
-        self.state.zero = self.prevState.zero
-        self.state.loc = self.prevState.loc
+        self.state = deepcopy(self.prevState)
         self.state.refresh_polyscape()
+        self.started = True
+        self.done = False
+        return self.state
 
     def __next__(self):
         return self.state
@@ -99,7 +150,6 @@ class ToolChange(Operation):
     def __next__(self):
         self.state.tool = self.tool
         self.state.loc = np.array([0, 0, 50e-3])
-        self.state.tool = self.state.tool.translate(self.state.loc)
         state.refresh_polyscape()
         self.done = True
         raise StopIteration
@@ -108,44 +158,32 @@ class ToolChange(Operation):
         return f"Change tool to " + self.desc
 
 class RotateWorkpiece(Operation):
-    def __init__(self, state, axis, angle, label):
-        self.axis = axis
-        self.angle = angle
+    def __init__(self, state, rotangle, label):
+        self.rotangle = rotangle
         self.label = label
         super().__init__(state)
 
     def __next__(self):
-        self.state.model.transform(mm.AffineXf3f.linear(mm.Matrix3f.rotation(self.axis, self.angle)))
-        #self.state.material.transform(mm.AffineXf3f.linear(mm.Matrix3f.rotation(self.axis, self.angle)))
+        self.state.model = self.state.model.rotate(self.rotangle)
+        self.state.material = self.state.material.rotate(self.rotangle)
         state.refresh_polyscape()
         self.done = True
         raise StopIteration
 
     def __str__(self):
-        return f"Rotate {math.degrees(self.angle):.0f} degrees around {self.label}-axis"	
+        return f"Rotate {self.rotangle} degrees"	
 
 class LinearInterpolate(Operation):
-    def __init__(self, state, to, axesmask, n=30):
+    def __init__(self, state, to, axesmask):
         self.to = to
         self.axesmask = axesmask
-        if np.linalg.norm((state.loc-to)[:2],ord=2) < 1e-8:
-            n = 1
-        self.n = n
         super().__init__(state)
-
-    def __iter__(self):
-        self.i = 0
-        self.delta = (self.to - self.state.loc)/(self.n) * self.axesmask
-        return super().__iter__()
-
+    
     def __next__(self):
-        self.state.tool = self.state.tool.translate(self.delta)
-        self.state.loc += self.delta
-        self.state.material -= self.state.tool
+        tomask = np.where(self.axesmask > 0.5, self.to, self.state.loc)
+        self.state.material -= self.state.tool.generate_linear_cutarea(self.state.loc, tomask)
+        self.state.loc = tomask
         state.refresh_polyscape()
-        self.i += 1
-        if self.i < self.n:
-            return self.state
         self.done = True
         raise StopIteration
 
@@ -171,15 +209,15 @@ def polyscope_callback():
         psim.TextUnformatted("Tool Type")
         psim.SameLine()
         if(psim.Button("End Mill")):
-            operations.append(ToolChange(state, generate_bit("endmill", tooldia*1e-3), f"{tooldia:.1f} mm endmill"))
+            operations.append(ToolChange(state, Tool("endmill", tooldia*1e-3, 50e-3), f"{tooldia:.1f} mm endmill"))
             play = True
         psim.SameLine()
         if(psim.Button("Ball Nose")):
-            operations.append(ToolChange(state, generate_bit("ballnose", tooldia*1e-3), f"{tooldia:.1f} mm ballnose"))
+            operations.append(ToolChange(state, Tool("ballnose", tooldia*1e-3, 50e-3), f"{tooldia:.1f} mm ballnose"))
             play = True
         psim.SameLine()
         if(psim.Button("Drill")):
-            operations.append(ToolChange(state, generate_bit("drill", tooldia*1e-3), f"{tooldia:.1f} mm drill"))
+            operations.append(ToolChange(state, Tool("drill", tooldia*1e-3, 50e-3), f"{tooldia:.1f} mm drill"))
             play = True
         psim.TreePop()
     
@@ -188,15 +226,15 @@ def polyscope_callback():
         psim.TextUnformatted("Rotation Axis")
         psim.SameLine()
         if(psim.Button("X")):
-            operations.append(RotateWorkpiece(state, mm.Vector3f(1, 0, 0), math.radians(rotangle), "X"))
+            operations.append(RotateWorkpiece(state, [rotangle, 0, 0], "X"))
             play = True
         psim.SameLine()
         if(psim.Button("Y")):
-            operations.append(RotateWorkpiece(state, mm.Vector3f(0, 1, 0), math.radians(rotangle), "Y"))
+            operations.append(RotateWorkpiece(state, [0, rotangle, 0], "Y"))
             play = True
         psim.SameLine()
         if(psim.Button("Z")):
-            operations.append(RotateWorkpiece(state, mm.Vector3f(0, 0, 1), math.radians(rotangle), "Z"))
+            operations.append(RotateWorkpiece(state, [0, 0, rotangle], "Z"))
             play = True
         psim.TreePop()
     
@@ -204,15 +242,15 @@ def polyscope_callback():
         changed, cx = psim.Checkbox("X axis", cx) 
         if cx:
             psim.SameLine()
-            changed, lx = psim.InputFloat("To [mm]", lx) 
+            changed, lx = psim.InputFloat("To X [mm]", lx) 
         changed, cy = psim.Checkbox("Y axis", cy)
         if cy:
             psim.SameLine()
-            changed, ly = psim.InputFloat("To [mm]2", ly)
+            changed, ly = psim.InputFloat("To Y [mm]", ly)
         changed, cz = psim.Checkbox("Z axis", cz)
         if cz:
             psim.SameLine()
-            changed, lz = psim.InputFloat("To [mm]3", lz)
+            changed, lz = psim.InputFloat("To Z [mm]", lz)
         if(psim.Button("Add")):
             operations.append(LinearInterpolate(state, np.array([lx*1e-3, ly*1e-3, lz*1e-3]), np.array([1 if cx else 0, 1 if cy else 0, 1 if cz else 0])))
             play = True
@@ -220,31 +258,35 @@ def polyscope_callback():
     
     psim.TextUnformatted("Playback")
     psim.SameLine()
-    if (psim.Button("< Back")):
+    
+    if (psim.Button("< Back")) and len(operations) > 0:
         if operationiter is not None:
             operationiter = None
         else:
             operationid = max(0, operationid - 1)
-        operations[operationid].restore()
-    
+        state = operations[operationid].restore()
+        lx, ly, lz = state.loc*1e3
+
     psim.SameLine()
-    if (psim.Button("Delete")) and operationid < len(operations):
-        operations[operationid].restore()
+    if (psim.Button("Delete")) and 0 <= operationid < len(operations):
+        if operationiter is not None:
+            operationiter = None
+        state = operations[operationid].restore()
+        lx, ly, lz = state.loc*1e3
         operations.pop(operationid)
 
     psim.SameLine()
-    if (play or psim.Button("Play >")) and operationid < len(operations):
+    if (play or psim.Button("Play >")) and 0 <= operationid < len(operations):
         if operationiter is None:
             operationiter = iter(operations[operationid])
     
     if operationiter is not None:
         try:
-            next(operationiter)
+            state = next(operationiter).state
         except StopIteration:
             operationiter = None
             operationid += 1
         lx, ly, lz = state.loc*1e3
-        
     psim.ListBox("Operations", operationid, [str(o) for o in operations])	
     
 
@@ -252,5 +294,4 @@ model_file = 'ledmain.obj'
 blank_size = np.array([75e-3, 25e-3, 50e-3])
 state = State.generate(model_file, blank_size)
 state.loc = np.array([0, 0, 50e-3])
-state.tool = state.tool.translate(state.loc)
 state.init_polyscope()
