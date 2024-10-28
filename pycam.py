@@ -80,6 +80,9 @@ class Tool:
 
         return cutarea
 
+    def __str__(self):
+        return f"{self.diameter:.1f} mm {self.type}"
+
 class State:
     def __init__(self, model, material, tool, zero, loc):
         self.model = model
@@ -121,78 +124,91 @@ class State:
         ps.register_surface_mesh("diff", self.material.to_mesh().vert_properties[:, :3], self.material.to_mesh().tri_verts).set_transparency(0.5)
 
 class Operation:
-    def __init__(self, state):
-        self.state = state
-        self.started = False
+    def execute(self, state):
+        self.prev_state = deepcopy(state)
+        for op, desc in self.steps():
+            op(state)
 
-    def __iter__(self):
-        self.prevState = deepcopy(self.state)
-        self.started = True
-        self.done = False
-        return self
-
+    def steps(self):
+        return
+    
     def restore(self):
-        self.state = deepcopy(self.prevState)
-        self.state.refresh_polyscape()
-        self.started = True
-        self.done = False
-        return self.state
+        return self.prev_state
 
-    def __next__(self):
-        return self.state
-
-class ToolChange(Operation):
-    def __init__(self, state, tool, desc):
-        self.tool = tool
-        self.desc = desc
-        super().__init__(state)
-
-    def __next__(self):
-        self.state.tool = self.tool
-        self.state.loc = np.array([0, 0, 50e-3])
-        state.refresh_polyscape()
-        self.done = True
-        raise StopIteration
+class LinearInterpolate(Operation):
+    def __init__(self, to):
+        self.to = to
+    
+    def steps(self):
+        def g01(state):
+            tomask = np.array([state.loc[i] if self.to[i] is None else self.to[i] for i in range(3)])
+            state.material -= state.tool.generate_linear_cutarea(state.loc, tomask)
+            state.loc = tomask
+        yield (g01, "G01 " + ' '.join('XYZ'[i] + f'{self.to[i]:.03f}' for i in range(3) if self.to[i] is not None))
 
     def __str__(self):
-        return f"Change tool to " + self.desc
+        return f"Linear interpolate to {self.to}"
+
+class ToolChange(Operation):
+    def __init__(self, tool):
+        self.tool = tool
+
+    def steps(self):
+        yield from LinearInterpolate([None,None,50e-3]).steps()
+        yield from LinearInterpolate([0,0,None]).steps()
+        def change(state):
+            state.tool = self.tool
+        yield (change, "% CHANGE TOOL TO " + str(self.tool).upper())
+
+    def __str__(self):
+        return f"Change tool to " + str(self.tool)
 
 class RotateWorkpiece(Operation):
-    def __init__(self, state, rotangle, label):
+    def __init__(self, rotangle):
         self.rotangle = rotangle
-        self.label = label
-        super().__init__(state)
 
-    def __next__(self):
-        self.state.model = self.state.model.rotate(self.rotangle)
-        self.state.material = self.state.material.rotate(self.rotangle)
-        state.refresh_polyscape()
-        self.done = True
-        raise StopIteration
+    def steps(self):
+        yield from LinearInterpolate([None,None,50e-3]).steps()
+        yield from LinearInterpolate([0,0,None]).steps()
+        def rotate(state):
+            state.model = state.model.rotate(self.rotangle)
+            state.material = state.material.rotate(self.rotangle)
+        yield (rotate, f"% ROTATE WORKPIECE BY {self.rotangle} DEGREES")
 
     def __str__(self):
         return f"Rotate {self.rotangle} degrees"	
 
-class LinearInterpolate(Operation):
-    def __init__(self, state, to, axesmask):
-        self.to = to
-        self.axesmask = axesmask
-        super().__init__(state)
+class SurfaceFlatten(Operation):
+    def __init__(self, startz, endz, stepz, xe, ye, stepover):
+        self.startz = startz
+        self.endz = endz
+        self.stepz = stepz
+        self.xe = xe
+        self.ye = ye
+        self.stepover = stepover
     
-    def __next__(self):
-        tomask = np.where(self.axesmask > 0.5, self.to, self.state.loc)
-        self.state.material -= self.state.tool.generate_linear_cutarea(self.state.loc, tomask)
-        self.state.loc = tomask
-        state.refresh_polyscape()
-        self.done = True
-        raise StopIteration
-
+    def steps(self):
+        for z in np.arange(self.startz, self.endz, self.stepz):
+            x = -self.xe
+            yield from LinearInterpolate([None,None,50e-3]).steps()
+            yield from LinearInterpolate([x, -self.ye, None]).steps()
+            yield from LinearInterpolate([None,None,z]).steps()
+            while x <= self.xe:
+                yield from LinearInterpolate([x, self.ye, None]).steps()
+                x += self.stepover
+                yield from LinearInterpolate([x, self.ye, None]).steps()
+                yield from LinearInterpolate([x, -self.ye, None]).steps()
+                x += self.stepover
+                yield from LinearInterpolate([x, -self.ye, None]).steps()
+    
     def __str__(self):
-        return f"Linear interpolate to {self.to}, mask {self.axesmask}"
+        return f"Surface flatten from {self.startz} to {self.endz} with step {self.stepz}"
+            
 
 operations = []
 operationid = 0
-operationiter = None
+subiter = None
+subid = 0
 
 tooldia = 4
 rotangle = 90
@@ -200,7 +216,7 @@ lx, ly, lz = 0, 0, 50
 cx, cy, cz = True, True, True
 
 def polyscope_callback():
-    global operations, operationid, operationiter, tooldia, rotangle, state, lx, ly, lz, cx, cy, cz
+    global operations, operationid, subiter, subid, tooldia, rotangle, state, lx, ly, lz, cx, cy, cz
 
     play = False
 
@@ -209,15 +225,15 @@ def polyscope_callback():
         psim.TextUnformatted("Tool Type")
         psim.SameLine()
         if(psim.Button("End Mill")):
-            operations.append(ToolChange(state, Tool("endmill", tooldia*1e-3, 50e-3), f"{tooldia:.1f} mm endmill"))
+            operations.append(ToolChange(Tool("endmill", tooldia*1e-3, 50e-3)))
             play = True
         psim.SameLine()
         if(psim.Button("Ball Nose")):
-            operations.append(ToolChange(state, Tool("ballnose", tooldia*1e-3, 50e-3), f"{tooldia:.1f} mm ballnose"))
+            operations.append(ToolChange(Tool("ballnose", tooldia*1e-3, 50e-3)))
             play = True
         psim.SameLine()
         if(psim.Button("Drill")):
-            operations.append(ToolChange(state, Tool("drill", tooldia*1e-3, 50e-3), f"{tooldia:.1f} mm drill"))
+            operations.append(ToolChange(Tool("drill", tooldia*1e-3, 50e-3)))
             play = True
         psim.TreePop()
     
@@ -226,15 +242,15 @@ def polyscope_callback():
         psim.TextUnformatted("Rotation Axis")
         psim.SameLine()
         if(psim.Button("X")):
-            operations.append(RotateWorkpiece(state, [rotangle, 0, 0], "X"))
+            operations.append(RotateWorkpiece([rotangle, 0, 0]))
             play = True
         psim.SameLine()
         if(psim.Button("Y")):
-            operations.append(RotateWorkpiece(state, [0, rotangle, 0], "Y"))
+            operations.append(RotateWorkpiece([0, rotangle, 0]))
             play = True
         psim.SameLine()
         if(psim.Button("Z")):
-            operations.append(RotateWorkpiece(state, [0, 0, rotangle], "Z"))
+            operations.append(RotateWorkpiece([0, 0, rotangle]))
             play = True
         psim.TreePop()
     
@@ -252,42 +268,74 @@ def polyscope_callback():
             psim.SameLine()
             changed, lz = psim.InputFloat("To Z [mm]", lz)
         if(psim.Button("Add")):
-            operations.append(LinearInterpolate(state, np.array([lx*1e-3, ly*1e-3, lz*1e-3]), np.array([1 if cx else 0, 1 if cy else 0, 1 if cz else 0])))
+            operations.append(LinearInterpolate([lx*1e-3 if cx else None, ly*1e-3 if cy else None, lz*1e-3 if cz else None]))
+            play = True
+        psim.TreePop()
+    
+    if (psim.TreeNode("Test")):
+        if(psim.Button("Add")):
+            operations.append(SurfaceFlatten(25e-3, 10e-3, -4e-3, 10e-3, 10e-3, stepover=0.5*state.tool.diameter))
             play = True
         psim.TreePop()
     
     psim.TextUnformatted("Playback")
     psim.SameLine()
     
-    if (psim.Button("< Back")) and len(operations) > 0:
-        if operationiter is not None:
-            operationiter = None
+    if (psim.Button("< Back")) and operationid > 0:
+        if subiter is None:
+            operationid -= 1
         else:
-            operationid = max(0, operationid - 1)
+            subiter = None
+            subid = 0
         state = operations[operationid].restore()
         lx, ly, lz = state.loc*1e3
+        state.refresh_polyscape()
 
     psim.SameLine()
-    if (psim.Button("Delete")) and 0 <= operationid < len(operations):
-        if operationiter is not None:
-            operationiter = None
+    if (psim.Button("Delete Last")) and operationid == len(operations):
+        operationid -= 1
         state = operations[operationid].restore()
         lx, ly, lz = state.loc*1e3
+        state.refresh_polyscape()
         operations.pop(operationid)
 
     psim.SameLine()
     if (play or psim.Button("Play >")) and 0 <= operationid < len(operations):
-        if operationiter is None:
-            operationiter = iter(operations[operationid])
-    
-    if operationiter is not None:
+        if subiter is None:
+            operations[operationid].execute(state)
+        else:
+            try:
+                while True:
+                    next(subiter)[0](state)
+                    subid += 1
+            except StopIteration:
+                subiter = None
+                subid = 0
+        operationid += 1
+        lx, ly, lz = state.loc*1e3
+        state.refresh_polyscape()
+
+    psim.SameLine()
+    if (play or psim.Button("Step single")) and 0 <= operationid < len(operations):
+        if subiter is None:
+            subiter = operations[operationid].steps()
+            subid = 0
+            operations[operationid].prev_state = deepcopy(state)
         try:
-            state = next(operationiter).state
+            next(subiter)[0](state)
+            subid += 1
         except StopIteration:
-            operationiter = None
+            subiter = None
+            subid = 0
             operationid += 1
         lx, ly, lz = state.loc*1e3
-    psim.ListBox("Operations", operationid, [str(o) for o in operations])	
+        state.refresh_polyscape()
+    
+    psim.ListBox("Operations", operationid, [str(o) for o in operations])
+    if 0 <= operationid < len(operations):
+        psim.ListBox("G-code", subid, [desc for op,desc in operations[operationid].steps()])
+    else:
+        psim.ListBox("G-code", 0, [])
     
 
 model_file = 'ledmain.obj'
