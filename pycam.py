@@ -7,8 +7,20 @@ import meshlib.mrmeshnumpy as mn
 import math
 import sys
 from copy import deepcopy
-from manifold3d import Manifold, set_circular_segments, CrossSection, Mesh
+from manifold3d import Manifold, set_circular_segments, CrossSection, Mesh, JoinType
+import pyclipr
 set_circular_segments(32)
+
+# TODO
+# - detect arcs and interpolate
+# - detect heights for moving between operations
+# - leadin
+# - ballnose
+# - pick faces to go to
+# - custom feedrates
+# - violation detection
+# - pick holes, flatten
+# - optimization
 
 Manifold.__deepcopy__ = lambda self, memo: Manifold.compose([self])
 
@@ -203,7 +215,97 @@ class SurfaceFlatten(Operation):
     
     def __str__(self):
         return f"Surface flatten from {self.startz} to {self.endz} with step {self.stepz}"
-            
+
+def safe_offset(crosssec, delta):
+    fixed_polys = []
+    for comp in crosssec.decompose():
+        polys = crosssec.to_polygons()
+        nums = []
+        for poly in polys:
+            n = len(poly)
+            number = sum((poly[i%n][0]-poly[(i-1)%n][0])*(poly[i%n][1]+poly[(i-1)%n][1]) for i in range(n))
+            nums.append(number)
+            print(number, delta, number/2, np.pi*delta**2/2)
+            if number*delta < 0 or number/2/(np.pi*delta**2) > 1:
+                fixed_polys.append(poly)
+    cleaned = CrossSection(fixed_polys)
+    return cleaned.offset(delta, JoinType.Round).simplify()
+
+def process(paths, bounds, climb=True):
+    pc2 = pyclipr.Clipper()
+    pc2.scaleFactor = int(1e6)
+    pc2.addPaths([np.concatenate((poly,poly[0:1,:])) for poly in paths.to_polygons()], pyclipr.Subject, True)
+    pc2.addPaths(bounds.to_polygons(), pyclipr.Clip, False)
+    _ = pc2.execute(pyclipr.Intersection, pyclipr.FillRule.NonZero)
+    _, openPathsC = pc2.execute(pyclipr.Intersection, pyclipr.FillRule.NonZero, returnOpenPaths=True)
+    for i in range(len(openPathsC)):
+        for j in range(i+1, len(openPathsC)):
+            if len(openPathsC[j]) > 0 and np.linalg.norm(openPathsC[i][0]-openPathsC[j][-1]) < 1e-6:
+                openPathsC[i] = np.concatenate((openPathsC[j], openPathsC[i]))
+                openPathsC[j] = np.array([])
+    openPathsC = [path[::-1] if climb else path for path in openPathsC if len(path) > 0]
+    return paths ^ bounds, openPathsC
+
+class RoughCut(Operation):
+    def __init__(self, state, startz, endz, stepz):
+        nslices = math.ceil((startz-endz)/stepz)
+        self.slices = [endz + i*stepz for i in range(nslices)][::-1]
+        self.slice_paths = [RoughCut.path_stacks(state, botz, stepz) for botz in self.slices]
+    
+    def path_stacks(state, botz, stepz, climb=True, stock=0.1e-3):
+        bounds = state.material.trim_by_plane([0,0,1], botz).trim_by_plane([0,0,-1], -botz-stepz).project()
+        bounds = safe_offset(bounds, 0.5*state.tool.diameter)
+        cut = state.model.trim_by_plane([0,0,1], botz).trim_by_plane([0,0,-1], -botz-stepz).project() ^ bounds
+        cut = safe_offset(cut, stock)
+
+        # offset outline until no operations remain
+        cncpaths = []
+        paths, cncpath = process(safe_offset(cut, 0.5*state.tool.diameter) if not cut.is_empty() else CrossSection.circle(0.4*state.tool.diameter), bounds, climb)
+        cncpaths.append(cncpath)
+        while not (bounds - paths).is_empty():
+            paths, cncpath = process(safe_offset(paths, 0.5*state.tool.diameter), bounds, climb)
+            if len(cncpath) == 0:
+                break
+            cncpaths.append(cncpath)
+        
+        # map paths to which paths need to be cut first
+        descendants = [[[] for _ in range(len(layer))] for layer in cncpaths]
+        for descarr, prevlayer, layer in zip(descendants, cncpaths[:-1], cncpaths[1:]):
+            for pathi, path in enumerate(layer):
+                mintotaldist, pathidx = 1e309, -1
+                for i, otherpath in enumerate(prevlayer):
+                    totaldist = sum(np.linalg.norm(point-otherpath, ord=2, axis=1).min() for point in path)
+                    if totaldist < mintotaldist:
+                        mintotaldist, pathidx = totaldist, i
+                if pathidx != -1:
+                    descarr[pathidx].append(pathi)
+        active = [(i,j) for i in range(len(cncpaths)) for j in range(len(cncpaths[i])) if len(descendants[i][j]) == 0]
+        process_arr = []
+
+        # sort paths to minimize travel distance
+        while len(active) > 0:
+            minidx = 0 if len(process_arr) == 0 else min(range(len(active)), key=lambda x: np.linalg.norm(process_arr[-1][-1,:]-cncpaths[active[x][0]][active[x][1]][0,:]))
+            i,j = active.pop(minidx)
+            process_arr.append(cncpaths[i][j])
+            for nj, arr in enumerate(descendants[i-1]):
+                if j in arr:
+                    arr.remove(j)
+                    if len(arr) == 0:
+                        active.append((i-1, nj))
+        return process_arr
+
+    def steps(self):
+        yield from LinearInterpolate([None,None,50e-3]).steps()
+        for botz, slice_path in zip(self.slices, self.slice_paths):
+            for path in slice_path:
+                yield from LinearInterpolate([path[0][0],path[0][1],None]).steps()
+                yield from LinearInterpolate([None,None,botz]).steps()
+                for point in path[1:]:
+                    yield from LinearInterpolate([point[0],point[1],None]).steps()
+                yield from LinearInterpolate([None,None,50e-3]).steps()
+    
+    def __str__(self):
+        return f"Rough cut from {self.slices[-1]} to {self.slices[0]}"
 
 operations = []
 operationid = 0
@@ -214,11 +316,11 @@ tooldia = 4
 rotangle = 90
 lx, ly, lz = 0, 0, 50
 cx, cy, cz = True, True, True
+fz, tz, sz = 50, 0, 1
+play = False
 
 def polyscope_callback():
-    global operations, operationid, subiter, subid, tooldia, rotangle, state, lx, ly, lz, cx, cy, cz
-
-    play = False
+    global operations, operationid, subiter, subid, tooldia, rotangle, state, lx, ly, lz, cx, cy, cz, fz, tz, sz, play
 
     if (psim.TreeNode("Change Tool")):
         changed, tooldia = psim.InputFloat("Diameter [mm]", tooldia) 
@@ -226,15 +328,12 @@ def polyscope_callback():
         psim.SameLine()
         if(psim.Button("End Mill")):
             operations.append(ToolChange(Tool("endmill", tooldia*1e-3, 50e-3)))
-            play = True
         psim.SameLine()
         if(psim.Button("Ball Nose")):
             operations.append(ToolChange(Tool("ballnose", tooldia*1e-3, 50e-3)))
-            play = True
         psim.SameLine()
         if(psim.Button("Drill")):
             operations.append(ToolChange(Tool("drill", tooldia*1e-3, 50e-3)))
-            play = True
         psim.TreePop()
     
     if (psim.TreeNode("Rotate Workpiece")):
@@ -243,15 +342,12 @@ def polyscope_callback():
         psim.SameLine()
         if(psim.Button("X")):
             operations.append(RotateWorkpiece([rotangle, 0, 0]))
-            play = True
         psim.SameLine()
         if(psim.Button("Y")):
             operations.append(RotateWorkpiece([0, rotangle, 0]))
-            play = True
         psim.SameLine()
         if(psim.Button("Z")):
             operations.append(RotateWorkpiece([0, 0, rotangle]))
-            play = True
         psim.TreePop()
     
     if (psim.TreeNode("Linear Interpolate")):
@@ -272,16 +368,19 @@ def polyscope_callback():
             play = True
         psim.TreePop()
     
-    if (psim.TreeNode("Test")):
+    if (psim.TreeNode("Rough Cut")):
+        changed, fz = psim.InputFloat("From Z [mm]", fz)
+        changed, tz = psim.InputFloat("Downto Z [mm]", tz)
+        changed, sz = psim.InputFloat("Step Z [mm]", sz)
         if(psim.Button("Add")):
-            operations.append(SurfaceFlatten(25e-3, 10e-3, -4e-3, 10e-3, 10e-3, stepover=0.5*state.tool.diameter))
-            play = True
+            operations.append(RoughCut(state, fz*1e-3, tz*1e-3, sz*1e-3))
         psim.TreePop()
     
     psim.TextUnformatted("Playback")
     psim.SameLine()
     
     if (psim.Button("< Back")) and operationid > 0:
+        play = False
         if subiter is None:
             operationid -= 1
         else:
@@ -300,23 +399,11 @@ def polyscope_callback():
         operations.pop(operationid)
 
     psim.SameLine()
-    if (play or psim.Button("Play >")) and 0 <= operationid < len(operations):
-        if subiter is None:
-            operations[operationid].execute(state)
-        else:
-            try:
-                while True:
-                    next(subiter)[0](state)
-                    subid += 1
-            except StopIteration:
-                subiter = None
-                subid = 0
-        operationid += 1
-        lx, ly, lz = state.loc*1e3
-        state.refresh_polyscape()
+    if (psim.Button("Play >") or play) and 0 <= operationid < len(operations):
+        play = True
 
     psim.SameLine()
-    if (play or psim.Button("Step single")) and 0 <= operationid < len(operations):
+    if (psim.Button("Step single") or play) and 0 <= operationid < len(operations):
         if subiter is None:
             subiter = operations[operationid].steps()
             subid = 0
@@ -328,6 +415,7 @@ def polyscope_callback():
             subiter = None
             subid = 0
             operationid += 1
+            play = False
         lx, ly, lz = state.loc*1e3
         state.refresh_polyscape()
     
