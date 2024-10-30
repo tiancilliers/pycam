@@ -172,21 +172,49 @@ for path in process_arr:
 for pp, xp in zip(process_arr[:-1], process_arr[1:]):
     plt.plot([pp[-1,0], xp[0,0]], [pp[-1,1], xp[0,1]], "g--")
 
-idx = 20
-plt.plot(process_arr[idx][:,0], process_arr[idx][:,1], "b-")
+idx = 25
+plt.plot(process_arr[idx][:,0], process_arr[idx][:,1], "b-+")
 plt.plot(process_arr[idx][0,0], process_arr[idx][0,1], "b+")
-us = []
-for p1,p2,p3 in zip(process_arr[idx][:-2], process_arr[idx][1:-1], process_arr[idx][2:]):
-    x = np.array([p1[0], p2[0], p3[0]])
-    y = np.array([p1[1], p2[1], p3[1]])
-    l = np.linalg.norm(np.vstack((x,y)), axis=0)**2
-    md = np.linalg.det(np.vstack((np.ones(3), x, y)))
-    mx = np.linalg.det(np.vstack((np.ones(3), x, l)))
-    my = np.linalg.det(np.vstack((np.ones(3), l, y)))
-    us.append(np.array([my, mx])/md/2)
-# while it would result in an error max 1e-6, merge the two adjacent arc segments with the least centerdist/radius ratio
-arcs = []
-# each item is a start idx, end idx, center, radius
 
+def eval_arc(path, i, j):
+    a = np.array([[path[k][0], path[k][1], 1] for k in range(i, j+1)])
+    b = np.array([(path[k][0]**2+path[k][1]**2) for k in range(i, j+1)])
+    dx, dy, a = np.linalg.lstsq(a, b, rcond=None)[0]
+    dx, dy = dx/2, dy/2
+    r = (dx**2+dy**2+a)**0.5
+    d = np.linalg.norm(path[i]-path[j])
+    if d/2 > r:
+        return 1e309, None
+    h = (r**2-(d/2)**2)**0.5
+    p1 = np.array([(path[j][0]-path[i][0])/2 + h*(path[j][1]-path[i][1])/d + path[i][0], (path[j][1]-path[i][1])/2 - h*(path[j][0]-path[i][0])/d + path[i][1]])
+    p2 = np.array([(path[j][0]-path[i][0])/2 - h*(path[j][1]-path[i][1])/d + path[i][0], (path[j][1]-path[i][1])/2 + h*(path[j][0]-path[i][0])/d + path[i][1]])
+    p = p1 if np.linalg.norm(p1-np.array([dx,dy])) < np.linalg.norm(p2-np.array([dx,dy])) else p2
+    maxerr = max(abs(np.linalg.norm(path[j]-p)-r) for j in range(i, j+1))
+    return maxerr, p
 
+def arcify_path(path, i, j):
+    print("ap", i, j)
+    ii = i
+    jj = i+2
+    longest = (2, ii, None)
+    while jj < j:
+        maxerr, p = eval_arc(path, ii, jj)
+        if maxerr < 5e-6:
+            if jj-ii > longest[0]:
+                longest = (jj-ii, ii, p)
+            jj += 1
+        else:
+            ii += 1
+    print(longest)
+    if longest[0] > 3:
+        return arcify_path(path, i, longest[1]) + [(2, path[longest[1]], path[longest[1]+longest[0]], longest[2])] + arcify_path(path, longest[1]+longest[0], j)
+    else:
+        return list(zip([1]*(j-i), path[i:j], path[i+1:j+1]))
+
+segs = arcify_path(process_arr[idx], 0, len(process_arr[idx]))
+for seg in segs:
+    if seg[0] == 1:
+        plt.plot([seg[1][0], seg[2][0]], [seg[1][1], seg[2][1]], "g-+")
+    else:
+        plt.plot([seg[1][0], seg[3][0], seg[2][0]], [seg[1][1], seg[3][1], seg[2][1]], "b-+")
 plt.show()
