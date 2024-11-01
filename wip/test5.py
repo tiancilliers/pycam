@@ -22,7 +22,12 @@ model = loadobj(model_file).rotate([90,0,0])
 material = Manifold.cube(blank_size, True).rotate([90,0,0])
 
 
-cut = model.trim_by_plane([0,0,1], 0e-3)
+endz = 0e-3
+stepz = 4e-3
+stock = 0.1e-3
+
+
+cut = model.trim_by_plane([0,0,1], endz+stock)
 verts = cut.to_mesh().vert_properties[:,:3]
 pts = []
 for tri in cut.to_mesh().tri_verts:
@@ -35,11 +40,18 @@ for tri in cut.to_mesh().tri_verts:
 pts.sort(key=lambda x: x[1])
 zstops = []
 for pt in pts:
-    print(pt[0])
     if not any(abs(zstop-pt[0]) < 1e-9 for zstop in zstops):
         zstops.append(pt[0])
-print(sorted(zstops))
+zstops = sorted(zstops)[::-1]
+startz = cut.bounding_box()[5]
+nslices = math.ceil((startz-endz-stock)/stepz)
+zsi = 0
+fzstops = []
+for pz in [endz + i*stepz + stock for i in range(nslices)][::-1]:
+    fzstops.append(pz)
+    while zsi < len(zstops) and zstops[zsi]+stock > pz-1e-9:
+        if zstops[zsi]+stock > pz+1e-9:
+            fzstops.append(zstops[zsi]+stock)
+        zsi += 1
 
-pts = np.array(pts)
-plt.scatter(pts[:,0], pts[:,1])
-plt.show()
+print(fzstops)

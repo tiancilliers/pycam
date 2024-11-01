@@ -100,7 +100,7 @@ class Tool:
         return cutarea
     
     def generate_curve_cutarea(self, loc1, loc2, center, code):
-        print(loc1, loc2, center, code)
+        #print(loc1, loc2, center, code)
         r = np.linalg.norm(loc1[:2]-center)
         angle = np.arctan2((-1 if code==3 else 1)*np.cross(loc2[:2]-center, loc1[:2]-center), np.dot(loc2[:2]-center, loc1[:2]-center)) % (2*np.pi)
         if np.linalg.norm(loc2[:2]-loc1[:2]) < 1e-9:
@@ -109,8 +109,8 @@ class Tool:
         angles = (-angles if code==2 else angles) + np.arctan2(loc1[1]-center[1], loc1[0]-center[0])
         pts = np.array([[center[0]+r*np.cos(a), center[1]+r*np.sin(a)] for a in angles])
         pts = np.hstack((pts, np.linspace(loc1[2], loc2[2], len(pts)).reshape(-1,1)))
-        print(r, angle, angles, pts)
-        print()
+        #print(r, angle, angles, pts)
+        #print()
         cutarea = Manifold()
         for i in range(len(pts)-1):
             cutarea += self.generate_linear_cutarea(pts[i], pts[i+1])
@@ -266,7 +266,7 @@ def safe_offset(crosssec, delta):
         for poly in polys:
             n = len(poly)
             number = sum((poly[i%n][0]-poly[(i-1)%n][0])*(poly[i%n][1]+poly[(i-1)%n][1]) for i in range(n))
-            print(number, delta, number/2, np.pi*delta**2/2)
+            #print(number, delta, number/2, np.pi*delta**2/2)
             if number*delta < 0 or abs(number)/2/(np.pi*delta**2) > 1:
                 fixed_polys.append(poly)
     cleaned = CrossSection(fixed_polys)
@@ -288,7 +288,7 @@ def process(paths, bounds, climb=True):
     return paths ^ bounds, openPathsC
 
 def arcify_path(path, i, j):
-    print("ap", i, j)
+    #print("ap", i, j)
     ii = i
     jj = i+2
     longest = (3, ii, None)
@@ -315,18 +315,51 @@ def arcify_path(path, i, j):
     else:
         return list(zip([1]*(j-i), path[i:j], path[i+1:j+1]))
 
+def generate_zstops(model, endz, stepz, stock):
+    cut = model.trim_by_plane([0,0,1], endz+stock)
+    verts = cut.to_mesh().vert_properties[:,:3]
+    pts = []
+    for tri in cut.to_mesh().tri_verts:
+        zs = verts[tri,2]
+        if max(zs)-min(zs) < 1e-9:
+            x1, y1, x2, y2, x3, y3 = *verts[tri[0],:2], *verts[tri[1],:2], *verts[tri[2],:2]
+            area = -0.5*(x1*(y2-y3) + x2*(y3-y1) + x3*(y1-y2))
+            if abs(area) > 1e-12:
+                pts.append([zs[0], area])
+    pts.sort(key=lambda x: x[1])
+    zstops = []
+    for pt in pts:
+        if not any(abs(zstop-pt[0]) < 1e-9 for zstop in zstops):
+            zstops.append(pt[0])
+    zstops = sorted(zstops)[::-1]
+    startz = cut.bounding_box()[5]
+    nslices = math.ceil((startz-endz-stock)/stepz)
+    zsi = 0
+    fzstops = []
+    for pz in [endz + i*stepz + stock for i in range(nslices)][::-1]:
+        fzstops.append(pz)
+        while zsi < len(zstops) and zstops[zsi]+stock > pz-1e-9:
+            if zstops[zsi]+stock > pz+1e-9:
+                fzstops.append(zstops[zsi]+stock)
+            zsi += 1
+    return fzstops
+
 class RoughCut(Operation):
     def __init__(self, state, startz, endz, stepz, stock=0.1e-3):
-        nslices = math.ceil((startz-endz)/stepz)
-
-        self.slices = [endz + i*stepz for i in range(nslices)][::-1]
-        self.slice_paths = [RoughCut.path_stacks(state, botz, stepz, stock=stock) for botz in self.slices]
+        self.slices = generate_zstops(state.model, endz, stepz, stock)
+        mat = state.material
+        self.slice_paths = []
+        for botz in self.slices:
+            sp, mat = RoughCut.path_stacks(state, botz, stepz, mat, stock=stock)
+            self.slice_paths.append(sp)
+        #self.slice_paths = [RoughCut.path_stacks(state, botz, stepz, stock=stock) for botz in self.slices]
     
-    def path_stacks(state, botz, stepz, climb=True, stock=0.1e-3):
-        bounds = state.material.trim_by_plane([0,0,1], botz).trim_by_plane([0,0,-1], -botz-stepz).project()
-        bounds = safe_offset(bounds, 0.5*state.tool.diameter)
+    def path_stacks(state, botz, stepz, mat, climb=True, stock=0.1e-3):
+        bounds = mat.trim_by_plane([0,0,1], botz+1e-8).trim_by_plane([0,0,-1], -botz-stepz).project()
+        bounds = safe_offset(bounds, 0.5*state.tool.diameter-1e-8)
         cut = state.model.trim_by_plane([0,0,1], botz).project() #.trim_by_plane([0,0,-1], -botz-stepz).project()
-        
+        cutextents = bounds - safe_offset(safe_offset(cut, 0.5*state.tool.diameter), -0.5*state.tool.diameter)
+        matleft = mat - Manifold.extrude(cutextents, state.tool.length).translate([0,0,botz])
 
         plt.figure()
         plt.xlim(-0.05, 0.05)
@@ -372,10 +405,15 @@ class RoughCut(Operation):
                     arr.remove(j)
                     if len(arr) == 0:
                         active.append((i-1, nj))
+        for path in process_arr:
+            plt.plot(path[:,0], path[:,1], "g-")
+            plt.plot(path[0,0], path[0,1], "g+")
+        for pp, xp in zip(process_arr[:-1], process_arr[1:]):
+            plt.plot([pp[-1,0], xp[0,0]], [pp[-1,1], xp[0,1]], "g--")
         segs = [arcify_path(path, 0, len(path)) for path in process_arr]
 
         plt.show()
-        return segs
+        return (segs, matleft)
 
     def steps(self):
         yield from LinearInterpolate([None,None,50e-3]).steps()
