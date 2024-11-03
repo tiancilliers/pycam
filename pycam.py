@@ -13,6 +13,7 @@ import matplotlib.pyplot as plt
 cs = 32
 set_circular_segments(cs)
 sf = 1-np.cos(np.pi/cs)
+print(3*sf)
 
 # TODO
 # - smart path ordering to improve speed            DONE
@@ -284,7 +285,6 @@ def arcify_path(path, i, j):
         return list(zip([1]*(j-i), path[i:j], path[i+1:j+1]))
 
 def find_topzstop(model, minz, maxz):
-    print(minz, maxz)
     cut = model.trim_by_plane([0,0,1], minz+1e-8).trim_by_plane([0,0,-1], -maxz+1e-8)
     verts = cut.to_mesh().vert_properties[:,:3]
     pts = []
@@ -301,7 +301,6 @@ def find_topzstop(model, minz, maxz):
         if not any(abs(zstop-pt[0]) < 1e-9 for zstop in zstops):
             zstops.append(pt[0])
     zstops = sorted(zstops)[::-1]
-    print(zstops)
     return zstops[0] if len(zstops) > 0 else None
 
 class RoughCut(Operation):
@@ -312,7 +311,7 @@ class RoughCut(Operation):
     
     def path_stacks(state, botz, climb=True, stock=0.1e-3):
         bounds = state.material.trim_by_plane([0,0,1], botz+5e-8).project()
-        bounds = safe_offset(bounds, (0.5*state.tool.diameter)*(1+2*sf))
+        bounds = safe_offset(bounds, (0.5*state.tool.diameter)*(1-3*sf))
         cut = state.model.trim_by_plane([0,0,1], botz).project()
 
         plt.figure()
@@ -376,23 +375,20 @@ class RoughCut(Operation):
         cut = state.model.trim_by_plane([0,0,1], self.endz+self.stock)
         startz = cut.bounding_box()[5]
         nslices = math.ceil((startz-self.endz-self.stock)/self.stepz)
-        for botz in [self.endz + i*self.stepz + self.stock for i in range(nslices)][::-1]:
+        for botz in [self.endz + i*self.stepz for i in range(nslices)][::-1]:
             cutz = botz
-            while True:
-                print("rough cut at ", cutz)
-                slice_path = RoughCut.path_stacks(state, cutz, stock=self.stock)
+            while cutz is not None:
+                slice_path = RoughCut.path_stacks(state, cutz+self.stock, stock=self.stock)
                 for path in slice_path:
                     yield from LinearInterpolate([path[0][1][0],path[0][1][1],None]).execute(state)
-                    yield from LinearInterpolate([None,None,cutz]).execute(state)
+                    yield from LinearInterpolate([None,None,cutz+self.stock]).execute(state)
                     for seg in path:
                         if seg[0] == 1:
                             yield from LinearInterpolate([seg[2][0],seg[2][1],None]).execute(state)
                         else:
                             yield from CircularInterpolate([seg[2][0],seg[2][1],None], seg[3], seg[0]).execute(state)
                     yield from LinearInterpolate([None,None,50e-3]).execute(state)
-                cutz = (find_topzstop(state.model, botz, botz+self.stepz) if abs(cutz-botz)<1e-9 else find_topzstop(state.model, botz, cutz-self.stock))+self.stock
-                if cutz is None:
-                    break
+                cutz = find_topzstop(state.model, botz+self.stock, botz+self.stepz+self.stock) if abs(cutz-botz)<1e-9 else find_topzstop(state.model, botz+self.stock, cutz)
     
     def __str__(self):
         return f"Rough cut from {self.endz} steps of {self.stepz} with {self.stock} stock"
