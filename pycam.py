@@ -10,7 +10,9 @@ from copy import deepcopy
 from manifold3d import Manifold, set_circular_segments, CrossSection, Mesh, JoinType
 import pyclipr
 import matplotlib.pyplot as plt
-set_circular_segments(32)
+cs = 32
+set_circular_segments(cs)
+sf = 1-np.cos(np.pi/cs)
 
 # TODO
 # - smart path ordering to improve speed            DONE
@@ -162,12 +164,7 @@ class State:
 class Operation:
     def execute(self, state):
         self.prev_state = deepcopy(state)
-        for op, desc in self.steps():
-            op(state)
 
-    def steps(self):
-        return
-    
     def restore(self):
         return self.prev_state
 
@@ -175,14 +172,13 @@ class LinearInterpolate(Operation):
     def __init__(self, to):
         self.to = to
     
-    def steps(self):
-        def g01(state):
-            tomask = np.array([state.loc[i] if self.to[i] is None else self.to[i] for i in range(3)])
-            state.material -= state.tool.generate_linear_cutarea(state.loc, tomask)
-            state.material = state.material.as_original()
-            state.loc = tomask
-        yield (g01, "G01 " + ' '.join('XYZ'[i] + f'{(self.to[i]*1e3):.03f}' for i in range(3) if self.to[i] is not None))
-
+    def execute(self, state):
+        super().execute(state)
+        tomask = np.array([state.loc[i] if self.to[i] is None else self.to[i] for i in range(3)])
+        state.material -= state.tool.generate_linear_cutarea(state.loc, tomask)
+        state.material = state.material.as_original()
+        state.loc = tomask
+        yield "G01 " + ' '.join('XYZ'[i] + f'{(self.to[i]*1e3):.03f}' for i in range(3) if self.to[i] is not None)
     def __str__(self):
         return f"Linear interpolate to {self.to}"
 
@@ -193,13 +189,13 @@ class CircularInterpolate(Operation):
         self.center = center
         self.code = code
     
-    def steps(self):
-        def g023(state):
-            tomask = np.array([state.loc[i] if self.to[i] is None else self.to[i] for i in range(3)])
-            state.material -= state.tool.generate_curve_cutarea(state.loc, tomask, self.center, self.code)
-            state.material = state.material.as_original()
-            state.loc = tomask
-        yield (g023, f"G0{self.code} " + ' '.join('XYZ'[i] + f'{(self.to[i]*1e3):.03f}' for i in range(3) if self.to[i] is not None) + ' '.join('IJ'[i] + f'{(self.center[i]*1e3):.03f}' for i in range(2)))
+    def execute(self, state):
+        super().execute(state)
+        tomask = np.array([state.loc[i] if self.to[i] is None else self.to[i] for i in range(3)])
+        state.material -= state.tool.generate_curve_cutarea(state.loc, tomask, self.center, self.code)
+        state.material = state.material.as_original()
+        state.loc = tomask
+        yield f"G0{self.code} " + ' '.join('XYZ'[i] + f'{(self.to[i]*1e3):.03f}' for i in range(3) if self.to[i] is not None) + ' '.join('IJ'[i] + f'{(self.center[i]*1e3):.03f}' for i in range(2))
     
     def __str__(self):
         return f"Circular interpolate to {self.to}"
@@ -208,12 +204,12 @@ class ToolChange(Operation):
     def __init__(self, tool):
         self.tool = tool
 
-    def steps(self):
-        yield from LinearInterpolate([None,None,50e-3]).steps()
-        yield from LinearInterpolate([0,0,None]).steps()
-        def change(state):
-            state.tool = self.tool
-        yield (change, "% CHANGE TOOL TO " + str(self.tool).upper())
+    def execute(self, state):
+        super().execute(state)
+        yield from LinearInterpolate([None,None,50e-3]).execute(state)
+        yield from LinearInterpolate([0,0,None]).execute(state)
+        state.tool = self.tool
+        yield "% CHANGE TOOL TO " + str(self.tool).upper()
 
     def __str__(self):
         return f"Change tool to " + str(self.tool)
@@ -222,42 +218,16 @@ class RotateWorkpiece(Operation):
     def __init__(self, rotangle):
         self.rotangle = rotangle
 
-    def steps(self):
-        yield from LinearInterpolate([None,None,50e-3]).steps()
-        yield from LinearInterpolate([0,0,None]).steps()
-        def rotate(state):
-            state.model = state.model.rotate(self.rotangle)
-            state.material = state.material.rotate(self.rotangle)
-        yield (rotate, f"% ROTATE WORKPIECE BY {self.rotangle} DEGREES")
+    def execute(self, state):
+        super().execute(state)
+        yield from LinearInterpolate([None,None,50e-3]).execute(state)
+        yield from LinearInterpolate([0,0,None]).execute(state)
+        state.model = state.model.rotate(self.rotangle)
+        state.material = state.material.rotate(self.rotangle)
+        yield f"% ROTATE WORKPIECE BY {self.rotangle} DEGREES"
 
     def __str__(self):
         return f"Rotate {self.rotangle} degrees"	
-
-class SurfaceFlatten(Operation):
-    def __init__(self, startz, endz, stepz, xe, ye, stepover):
-        self.startz = startz
-        self.endz = endz
-        self.stepz = stepz
-        self.xe = xe
-        self.ye = ye
-        self.stepover = stepover
-    
-    def steps(self):
-        for z in np.arange(self.startz, self.endz, self.stepz):
-            x = -self.xe
-            yield from LinearInterpolate([None,None,50e-3]).steps()
-            yield from LinearInterpolate([x, -self.ye, None]).steps()
-            yield from LinearInterpolate([None,None,z]).steps()
-            while x <= self.xe:
-                yield from LinearInterpolate([x, self.ye, None]).steps()
-                x += self.stepover
-                yield from LinearInterpolate([x, self.ye, None]).steps()
-                yield from LinearInterpolate([x, -self.ye, None]).steps()
-                x += self.stepover
-                yield from LinearInterpolate([x, -self.ye, None]).steps()
-    
-    def __str__(self):
-        return f"Surface flatten from {self.startz} to {self.endz} with step {self.stepz}"
 
 def safe_offset(crosssec, delta):
     fixed_polys = []
@@ -266,7 +236,6 @@ def safe_offset(crosssec, delta):
         for poly in polys:
             n = len(poly)
             number = sum((poly[i%n][0]-poly[(i-1)%n][0])*(poly[i%n][1]+poly[(i-1)%n][1]) for i in range(n))
-            #print(number, delta, number/2, np.pi*delta**2/2)
             if number*delta < 0 or abs(number)/2/(np.pi*delta**2) > 1:
                 fixed_polys.append(poly)
     cleaned = CrossSection(fixed_polys)
@@ -288,7 +257,6 @@ def process(paths, bounds, climb=True):
     return paths ^ bounds, openPathsC
 
 def arcify_path(path, i, j):
-    #print("ap", i, j)
     ii = i
     jj = i+2
     longest = (3, ii, None)
@@ -315,13 +283,14 @@ def arcify_path(path, i, j):
     else:
         return list(zip([1]*(j-i), path[i:j], path[i+1:j+1]))
 
-def generate_zstops(model, endz, stepz, stock):
-    cut = model.trim_by_plane([0,0,1], endz+stock)
+def find_topzstop(model, minz, maxz):
+    print(minz, maxz)
+    cut = model.trim_by_plane([0,0,1], minz+1e-8).trim_by_plane([0,0,-1], -maxz+1e-8)
     verts = cut.to_mesh().vert_properties[:,:3]
     pts = []
     for tri in cut.to_mesh().tri_verts:
         zs = verts[tri,2]
-        if max(zs)-min(zs) < 1e-9:
+        if max(zs)-min(zs) < 1e-9 and max(zs) > minz+2e-8 and min(zs) < maxz-2e-8:
             x1, y1, x2, y2, x3, y3 = *verts[tri[0],:2], *verts[tri[1],:2], *verts[tri[2],:2]
             area = -0.5*(x1*(y2-y3) + x2*(y3-y1) + x3*(y1-y2))
             if abs(area) > 1e-12:
@@ -332,33 +301,19 @@ def generate_zstops(model, endz, stepz, stock):
         if not any(abs(zstop-pt[0]) < 1e-9 for zstop in zstops):
             zstops.append(pt[0])
     zstops = sorted(zstops)[::-1]
-    #startz = cut.bounding_box()[5]
-    #nslices = math.ceil((startz-endz-stock)/stepz)
-    #zsi = 0
-    #fzstops = []
-    #for pz in [endz + i*stepz + stock for i in range(nslices)][::-1]:
-    #    fzstops.append(pz)
-    #    while zsi < len(zstops) and zstops[zsi]+stock > pz-1e-9:
-    #        if zstops[zsi]+stock > pz+1e-9:
-    #            fzstops.append(zstops[zsi]+stock)
-    #        zsi += 1
-    return [zs + stock for zs in zstops]
+    print(zstops)
+    return zstops[0] if len(zstops) > 0 else None
 
 class RoughCut(Operation):
-    def __init__(self, state, startz, endz, stepz, stock=0.1e-3):
-        self.slices = generate_zstops(state.model, endz, stepz, stock)
-        mat = state.material
-        self.slice_paths = []
-        for botz in self.slices:
-            sp, mat = RoughCut.path_stacks(state, botz, stepz, mat, stock=stock)
-            self.slice_paths.append(sp)
-        #self.slice_paths = [RoughCut.path_stacks(state, botz, stepz, stock=stock) for botz in self.slices]
+    def __init__(self, endz, stepz, stock=0.1e-3):
+        self.endz = endz
+        self.stepz = stepz
+        self.stock = stock
     
-    def path_stacks(state, botz, stepz, mat, climb=True, stock=0.1e-3):
-        bounds = state.material.trim_by_plane([0,0,1], botz).trim_by_plane([0,0,-1], -botz-stepz).project()
-        bounds = safe_offset(bounds, 0.5*state.tool.diameter)
-        cut = state.model.trim_by_plane([0,0,1], botz).project() #.trim_by_plane([0,0,-1], -botz-stepz).project()
-        #total_cutarea = Manifold()
+    def path_stacks(state, botz, climb=True, stock=0.1e-3):
+        bounds = state.material.trim_by_plane([0,0,1], botz+5e-8).project()
+        bounds = safe_offset(bounds, (0.5*state.tool.diameter)*(1+2*sf))
+        cut = state.model.trim_by_plane([0,0,1], botz).project()
 
         plt.figure()
         plt.xlim(-0.05, 0.05)
@@ -410,33 +365,40 @@ class RoughCut(Operation):
         for pp, xp in zip(process_arr[:-1], process_arr[1:]):
             plt.plot([pp[-1,0], xp[0,0]], [pp[-1,1], xp[0,1]], "g--")
         segs = [arcify_path(path, 0, len(path)) for path in process_arr]
-        #for seg in segs:
-        #    for s in seg:
-        #        if s[0] == 1:
-        #            total_cutarea += state.tool.generate_linear_cutarea(np.concatenate((s[1], [botz])), np.concatenate((s[2], [botz])))
-        #        else:
-        #            total_cutarea += state.tool.generate_curve_cutarea(np.concatenate((s[1], [botz])), np.concatenate((s[2], [botz])), s[3], s[0])
 
         plt.show()
-        return (segs, mat)#-total_cutarea)
+        return segs
 
-    def steps(self):
-        yield from LinearInterpolate([None,None,50e-3]).steps()
-        for botz, slice_path in zip(self.slices, self.slice_paths):
-            for path in slice_path:
-                yield from LinearInterpolate([path[0][1][0],path[0][1][1],None]).steps()
-                yield from LinearInterpolate([None,None,botz]).steps()
-                for seg in path:
-                    if seg[0] == 1:
-                        yield from LinearInterpolate([seg[2][0],seg[2][1],None]).steps()
-                    else:
-                        yield from CircularInterpolate([seg[2][0],seg[2][1],None], seg[3], seg[0]).steps()
-                yield from LinearInterpolate([None,None,50e-3]).steps()
+    def execute(self, state):
+        super().execute(state)
+        yield from LinearInterpolate([None,None,50e-3]).execute(state)
+
+        cut = state.model.trim_by_plane([0,0,1], self.endz+self.stock)
+        startz = cut.bounding_box()[5]
+        nslices = math.ceil((startz-self.endz-self.stock)/self.stepz)
+        for botz in [self.endz + i*self.stepz + self.stock for i in range(nslices)][::-1]:
+            cutz = botz
+            while True:
+                print("rough cut at ", cutz)
+                slice_path = RoughCut.path_stacks(state, cutz, stock=self.stock)
+                for path in slice_path:
+                    yield from LinearInterpolate([path[0][1][0],path[0][1][1],None]).execute(state)
+                    yield from LinearInterpolate([None,None,cutz]).execute(state)
+                    for seg in path:
+                        if seg[0] == 1:
+                            yield from LinearInterpolate([seg[2][0],seg[2][1],None]).execute(state)
+                        else:
+                            yield from CircularInterpolate([seg[2][0],seg[2][1],None], seg[3], seg[0]).execute(state)
+                    yield from LinearInterpolate([None,None,50e-3]).execute(state)
+                cutz = (find_topzstop(state.model, botz, botz+self.stepz) if abs(cutz-botz)<1e-9 else find_topzstop(state.model, botz, cutz-self.stock))+self.stock
+                if cutz is None:
+                    break
     
     def __str__(self):
-        return f"Rough cut from {self.slices[-1]} to {self.slices[0]}"
+        return f"Rough cut from {self.endz} steps of {self.stepz} with {self.stock} stock"
 
 operations = []
+opcodes = []
 operationid = 0
 subiter = None
 subid = 0
@@ -445,25 +407,25 @@ tooldia = 4
 rotangle = 90
 lx, ly, lz = 0, 0, 50
 cx, cy, cz = True, True, True
-fz, tz, sz = 50, 0, 1
+tz, sz = 8.5, 4
 play = False
 lvs = 0.1
 
 def polyscope_callback():
-    global operations, operationid, subiter, subid, tooldia, rotangle, state, lx, ly, lz, cx, cy, cz, fz, tz, sz, play, lvs
+    global operations, opcodes, operationid, subiter, subid, tooldia, rotangle, state, lx, ly, lz, cx, cy, cz, tz, sz, play, lvs
 
     if (psim.TreeNode("Change Tool")):
         changed, tooldia = psim.InputFloat("Diameter [mm]", tooldia) 
         psim.TextUnformatted("Tool Type")
         psim.SameLine()
         if(psim.Button("End Mill")):
-            operations.append(ToolChange(Tool("endmill", tooldia*1e-3, 50e-3)))
+            operations.append((ToolChange(Tool("endmill", tooldia*1e-3, 50e-3)), []))
         psim.SameLine()
         if(psim.Button("Ball Nose")):
-            operations.append(ToolChange(Tool("ballnose", tooldia*1e-3, 50e-3)))
+            operations.append((ToolChange(Tool("ballnose", tooldia*1e-3, 50e-3)), []))
         psim.SameLine()
         if(psim.Button("Drill")):
-            operations.append(ToolChange(Tool("drill", tooldia*1e-3, 50e-3)))
+            operations.append((ToolChange(Tool("drill", tooldia*1e-3, 50e-3)), []))
         psim.TreePop()
     
     if (psim.TreeNode("Rotate Workpiece")):
@@ -471,13 +433,13 @@ def polyscope_callback():
         psim.TextUnformatted("Rotation Axis")
         psim.SameLine()
         if(psim.Button("X")):
-            operations.append(RotateWorkpiece([rotangle, 0, 0]))
+            operations.append((RotateWorkpiece([rotangle, 0, 0]), []))
         psim.SameLine()
         if(psim.Button("Y")):
-            operations.append(RotateWorkpiece([0, rotangle, 0]))
+            operations.append((RotateWorkpiece([0, rotangle, 0]), []))
         psim.SameLine()
         if(psim.Button("Z")):
-            operations.append(RotateWorkpiece([0, 0, rotangle]))
+            operations.append((RotateWorkpiece([0, 0, rotangle]), []))
         psim.TreePop()
     
     if (psim.TreeNode("Linear Interpolate")):
@@ -494,17 +456,16 @@ def polyscope_callback():
             psim.SameLine()
             changed, lz = psim.InputFloat("To Z [mm]", lz)
         if(psim.Button("Add")):
-            operations.append(LinearInterpolate([lx*1e-3 if cx else None, ly*1e-3 if cy else None, lz*1e-3 if cz else None]))
+            operations.append((LinearInterpolate([lx*1e-3 if cx else None, ly*1e-3 if cy else None, lz*1e-3 if cz else None]), []))
             play = True
         psim.TreePop()
     
     if (psim.TreeNode("Rough Cut")):
-        changed, fz = psim.InputFloat("From Z [mm]", fz)
         changed, tz = psim.InputFloat("Downto Z [mm]", tz)
         changed, sz = psim.InputFloat("Step Z [mm]", sz)
         changed, lvs = psim.InputFloat("Leave Stock [mm]", lvs)
         if(psim.Button("Add")):
-            operations.append(RoughCut(state, fz*1e-3, tz*1e-3, sz*1e-3, stock=lvs*1e-3))
+            operations.append((RoughCut(tz*1e-3, sz*1e-3, stock=lvs*1e-3), []))
         psim.TreePop()
     
     psim.TextUnformatted("Playback")
@@ -516,45 +477,40 @@ def polyscope_callback():
             operationid -= 1
         else:
             subiter = None
-            subid = 0
-        state = operations[operationid].restore()
+        state = operations[operationid][0].restore()
+        operations[operationid][1] = []
         lx, ly, lz = state.loc*1e3
         state.refresh_polyscape()
 
     psim.SameLine()
     if (psim.Button("Delete Last")) and operationid == len(operations):
         operationid -= 1
-        state = operations[operationid].restore()
+        state = operations[operationid][0].restore()
         lx, ly, lz = state.loc*1e3
         state.refresh_polyscape()
         operations.pop(operationid)
 
     psim.SameLine()
-    if (psim.Button("Play >") or play) and 0 <= operationid < len(operations):
+    if (psim.Button("Process >") or play) and 0 <= operationid < len(operations):
         play = True
 
     psim.SameLine()
     if (psim.Button("Step single") or play) and 0 <= operationid < len(operations):
         if subiter is None:
-            subiter = operations[operationid].steps()
-            subid = 0
-            operations[operationid].prev_state = deepcopy(state)
+            subiter = operations[operationid][0].execute(state)
         try:
-            next(subiter)[0](state)
-            subid += 1
+            operations[operationid][1].append(next(subiter))
         except StopIteration:
             subiter = None
-            subid = 0
             operationid += 1
             play = False
         lx, ly, lz = state.loc*1e3
         state.refresh_polyscape()
     
-    psim.ListBox("Operations", operationid, [str(o) for o in operations])
-    if 0 <= operationid < len(operations):
-        psim.ListBox("G-code", subid, [desc for op,desc in operations[operationid].steps()])
-    else:
-        psim.ListBox("G-code", 0, [])
+    psim.ListBox("Operations", operationid, [str(o[0]) for o in operations])
+    gcodes = [desc for o in operations for desc in o[1]]
+    psim.ListBox("G-code", len(gcodes)-1, gcodes)
+
     
 
 model_file = 'ledmain.obj'
