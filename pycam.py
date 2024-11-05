@@ -7,30 +7,26 @@ import meshlib.mrmeshnumpy as mn
 import math
 import sys
 from copy import deepcopy
+from scipy.spatial import KDTree
 from manifold3d import Manifold, set_circular_segments, CrossSection, Mesh, JoinType
 import pyclipr
 import matplotlib.pyplot as plt
-cs = 32
-set_circular_segments(cs)
-sf = 1-np.cos(np.pi/cs)
-print(3*sf)
+from multiprocessing import Pool
 
 # TODO
 # - smart path ordering to improve speed            DONE
 # - detect arcs and interpolate                     DONE
-# - detect heights for moving between operations
+# - detect heights for moving between operations    DONE
 # - leadin
 # - ballnose
 # - pick faces to go to
-# - custom feedrates
+# - custom feedrates                                DONE
 # - violation detection
 # - pick holes, flatten
-# - optimization
-# - put G90.1 first (preamble)
+# - optimization                                    PARTIALLY DONE
+# - put G90.1 first (preamble)                      DONE
 # - change zero position
 # - only remove inside material/avoid clamps
-
-Manifold.__deepcopy__ = lambda self, memo: Manifold.compose([self])
 
 def loadobj(filename):
     model = mm.loadMesh(filename)
@@ -38,12 +34,44 @@ def loadobj(filename):
     mesh = Mesh(vert_properties = mn.getNumpyVerts(model), tri_verts = mn.getNumpyFaces(model.topology))   
     return Manifold(mesh)
 
+class BooleanTree():
+    def __init__(self, n):
+        self.n = 2**math.ceil(math.log2(n))
+        self.tree = [False] * (2*self.n-1)
+
+    def get_sum(self, l, r):
+        l += self.n - 1
+        r += self.n - 2
+        sum = 0
+        while (l <= r):
+            if ((l % 2) == 0):
+                sum = sum or self.tree[l]
+                l = (l + 1 - 1) // 2
+            else:
+                l = (l - 1) // 2
+            if ((r % 2) == 1):
+                sum = sum or self.tree[r]
+                r = (r - 1 - 2) // 2
+            else:
+                r = (r - 2) // 2
+        return sum
+
+    def update(self, i, value):
+        node = self.n - 1 + i
+        self.tree[node] = value
+        while node > 0:
+            node = (node - 1) // 2
+            left_child = node * 2 + 1
+            right_child = node * 2 + 2
+            self.tree[node] = self.tree[left_child] or self.tree[right_child]
 
 class Tool:
-    def __init__(self, type, diameter, length=50e-3):
+    def __init__(self, type, diameter, length=50e-3, teeth=2, fpt=0.025):
         self.type = type
         self.diameter = diameter
         self.length = length
+        self.teeth = teeth
+        self.fpt = fpt
     
     def generate_bit(self, loc):
         if self.type == "endmill":
@@ -108,7 +136,7 @@ class Tool:
         angle = np.arctan2((-1 if code==3 else 1)*np.cross(loc2[:2]-center, loc1[:2]-center), np.dot(loc2[:2]-center, loc1[:2]-center)) % (2*np.pi)
         if np.linalg.norm(loc2[:2]-loc1[:2]) < 1e-9:
             angle = 2*np.pi
-        angles = np.linspace(0, angle, math.ceil(abs(angle)/np.pi*16)+2)
+        angles = np.linspace(0, angle, math.ceil(abs(angle)/np.pi*32)+2)
         angles = (-angles if code==2 else angles) + np.arctan2(loc1[1]-center[1], loc1[0]-center[0])
         pts = np.array([[center[0]+r*np.cos(a), center[1]+r*np.sin(a)] for a in angles])
         pts = np.hstack((pts, np.linspace(loc1[2], loc2[2], len(pts)).reshape(-1,1)))
@@ -170,8 +198,9 @@ class Operation:
         return self.prev_state
 
 class LinearInterpolate(Operation):
-    def __init__(self, to):
+    def __init__(self, to, fast=False):
         self.to = to
+        self.fast = fast
     
     def execute(self, state):
         super().execute(state)
@@ -179,7 +208,11 @@ class LinearInterpolate(Operation):
         state.material -= state.tool.generate_linear_cutarea(state.loc, tomask)
         state.material = state.material.as_original()
         state.loc = tomask
-        yield "G01 " + ' '.join('XYZ'[i] + f'{(self.to[i]*1e3):.03f}' for i in range(3) if self.to[i] is not None)
+        if not self.fast:
+            feedr = state.tool.teeth*state.tool.fpt*rpm*(1 if self.to[2] is None else 0.5)
+            yield "G01 " + ' '.join('XYZ'[i] + f'{(self.to[i]*1e3):.03f}' for i in range(3) if self.to[i] is not None) + f" F{int(feedr)}"
+        else:
+            yield "G00 " + ' '.join('XYZ'[i] + f'{(self.to[i]*1e3):.03f}' for i in range(3) if self.to[i] is not None)
     def __str__(self):
         return f"Linear interpolate to {self.to}"
 
@@ -196,7 +229,8 @@ class CircularInterpolate(Operation):
         state.material -= state.tool.generate_curve_cutarea(state.loc, tomask, self.center, self.code)
         state.material = state.material.as_original()
         state.loc = tomask
-        yield f"G0{self.code} " + ' '.join('XYZ'[i] + f'{(self.to[i]*1e3):.03f}' for i in range(3) if self.to[i] is not None) + ' '.join('IJ'[i] + f'{(self.center[i]*1e3):.03f}' for i in range(2))
+        feedr = state.tool.teeth*state.tool.fpt*rpm*(1 if self.to[2] is None else 0.5)
+        yield f"G0{self.code} " + ' '.join('XYZ'[i] + f'{(self.to[i]*1e3):.03f}' for i in range(3) if self.to[i] is not None) + ' ' + ' '.join('IJ'[i] + f'{(self.center[i]*1e3):.03f}' for i in range(2)) + f" F{int(feedr)}"
     
     def __str__(self):
         return f"Circular interpolate to {self.to}"
@@ -210,7 +244,7 @@ class ToolChange(Operation):
         yield from LinearInterpolate([None,None,50e-3]).execute(state)
         yield from LinearInterpolate([0,0,None]).execute(state)
         state.tool = self.tool
-        yield "% CHANGE TOOL TO " + str(self.tool).upper()
+        yield "M5\nM0\n% CHANGE TOOL TO " + str(self.tool).upper() + "\nM3"
 
     def __str__(self):
         return f"Change tool to " + str(self.tool)
@@ -225,19 +259,19 @@ class RotateWorkpiece(Operation):
         yield from LinearInterpolate([0,0,None]).execute(state)
         state.model = state.model.rotate(self.rotangle)
         state.material = state.material.rotate(self.rotangle)
-        yield f"% ROTATE WORKPIECE BY {self.rotangle} DEGREES"
+        yield f"M5\nM0\n% ROTATE WORKPIECE BY {self.rotangle} DEGREES\nM3"
 
     def __str__(self):
         return f"Rotate {self.rotangle} degrees"	
 
-def safe_offset(crosssec, delta):
+def safe_offset(crosssec, delta, sign=1):
     fixed_polys = []
     for comp in crosssec.decompose():
         polys = crosssec.to_polygons()
         for poly in polys:
             n = len(poly)
             number = sum((poly[i%n][0]-poly[(i-1)%n][0])*(poly[i%n][1]+poly[(i-1)%n][1]) for i in range(n))
-            if number*delta < 0 or abs(number)/2/(np.pi*delta**2) > 1:
+            if sign*number*delta < 0 or abs(number/2/(np.pi*delta**2)) > 1:
                 fixed_polys.append(poly)
     cleaned = CrossSection(fixed_polys)
     return cleaned.offset(delta, JoinType.Round).simplify()
@@ -255,34 +289,56 @@ def process(paths, bounds, climb=True):
                 openPathsC[i] = np.concatenate((openPathsC[j], openPathsC[i]))
                 openPathsC[j] = np.array([])
     openPathsC = [path[::-1] if climb else path for path in openPathsC if len(path) > 0]
+
     return paths ^ bounds, openPathsC
 
-def arcify_path(path, i, j):
-    ii = i
-    jj = i+2
-    longest = (3, ii, None)
-    while jj < j:
-        if jj-ii > longest[0]:
-            a = np.array([[2*((path[k][0]-path[ii][0])*(path[ii][1]-path[jj][1]) + (path[k][1]-path[ii][1])*(path[jj][0]-path[ii][0]))] for k in range(ii+1, jj)])
+def arcify_path(path):
+    segs = []
+    ii = 0
+    jj = 4
+    while jj < len(path):
+        if jj-ii > 3:
+            patharr = np.array(path[ii:jj+1])
+            a = 2*np.sum((patharr[1:-1]-np.array(path[ii]))*np.array([path[ii][1]-path[jj][1], path[jj][0]-path[ii][0]]), axis=1).reshape(-1,1)
             b = np.array([path[k][0]*(path[k][0]-path[ii][0]-path[jj][0]) + path[k][1]*(path[k][1]-path[ii][1]-path[jj][1]) + path[ii][0]*path[jj][0] + path[ii][1]*path[jj][1] for k in range(ii+1, jj)])
             k = np.linalg.lstsq(a, b, rcond=None)[0][0]
             x, y = 0.5*(path[ii][0]+path[jj][0])+k*(path[ii][1]-path[jj][1]), 0.5*(path[ii][1]+path[jj][1])+k*(path[jj][0]-path[ii][0])
             p = np.array([x, y])
             r = np.linalg.norm(path[ii]-p)
-            maxerr = max(abs(np.linalg.norm(path[k]-p)-r) for k in range(ii+1, jj))
-            maxerr = max(maxerr, max(abs(np.linalg.norm(0.5*path[k]+0.5*path[k+1]-p)-r) for k in range(ii, jj)))
+            maxerr = np.max(np.abs(np.linalg.norm(patharr[1:-1]-p, axis=1)-r))
+            circ = np.sum(np.linalg.norm(patharr[1:]-patharr[:-1], axis=1))
+            maxerr = max(maxerr, np.max(np.abs(np.linalg.norm(0.5*patharr[1:]+0.5*patharr[:-1]-p, axis=1)-r)))
             if maxerr < 2e-5:
-                longest = (jj-ii, ii, p)
+                if circ/r > 2*np.pi/64:
+                    segs.append((jj-ii, ii, p))
                 jj += 1
             else:
                 ii += 1
         else:
             jj += 1
-    if longest[2] is not None:
-        code = 3 if np.cross(path[longest[1]]-longest[2], path[longest[1]+1]-path[longest[1]]) > 0 else 2
-        return arcify_path(path, i, longest[1]) + [(code, path[longest[1]], path[longest[1]+longest[0]], longest[2])] + arcify_path(path, longest[1]+longest[0], j)
-    else:
-        return list(zip([1]*(j-i), path[i:j], path[i+1:j+1]))
+    used = BooleanTree(len(path))
+    segs2 = []
+    for seg in sorted(segs, key=lambda x: x[0], reverse=True):
+        if not used.get_sum(seg[1], seg[1]+seg[0]):
+            for k in range(seg[1]+1, seg[1]+seg[0]-1):
+                used.update(k, True)
+            segs2.append(seg)   
+    segs3 = []
+    segs2.sort(key=lambda x: x[1])
+    #print(segs2)
+    if len(segs2) == 0:
+        return list(zip([1]*(len(path)-1), path[:-1], path[1:]))
+    elif segs2[0][1] > 0:
+        segs3 += list(zip([1]*segs2[0][1], path[:segs2[0][1]], path[1:segs2[0][1]+1]))
+    for segi, seg in enumerate(segs2):
+        code = 3 if np.cross(path[seg[1]]-seg[2], path[seg[1]+2]-seg[2]) > 0 else 2
+        segs3.append((code, path[seg[1]], path[seg[1]+seg[0]], seg[2]))
+        endidx = seg[1]+seg[0]
+        nextstart = segs2[segi+1][1] if segi+1 < len(segs2) else len(path)-1
+        if endidx < nextstart:
+            #print([1]*(nextstart-endidx), path[endidx:nextstart-1], path[endidx+1:nextstart])
+            segs3 += list(zip([1]*(nextstart-endidx), path[endidx:nextstart], path[endidx+1:nextstart+1]))
+    return segs3
 
 def find_topzstop(model, minz, maxz):
     cut = model.trim_by_plane([0,0,1], minz+1e-8).trim_by_plane([0,0,-1], -maxz+1e-8)
@@ -292,8 +348,9 @@ def find_topzstop(model, minz, maxz):
         zs = verts[tri,2]
         if max(zs)-min(zs) < 1e-9 and max(zs) > minz+2e-8 and min(zs) < maxz-2e-8:
             x1, y1, x2, y2, x3, y3 = *verts[tri[0],:2], *verts[tri[1],:2], *verts[tri[2],:2]
+            norm = np.cross(verts[tri[1],:2]-verts[tri[0],:2], verts[tri[2],:2]-verts[tri[0],:2])
             area = -0.5*(x1*(y2-y3) + x2*(y3-y1) + x3*(y1-y2))
-            if abs(area) > 1e-12:
+            if abs(area) > 1e-12 and norm > 0:
                 pts.append([zs[0], area])
     pts.sort(key=lambda x: x[1])
     zstops = []
@@ -310,41 +367,48 @@ class RoughCut(Operation):
         self.stock = stock
     
     def path_stacks(state, botz, climb=True, stock=0.1e-3):
-        bounds = state.material.trim_by_plane([0,0,1], botz+5e-8).project()
-        bounds = safe_offset(bounds, (0.5*state.tool.diameter)*(1-3*sf))
-        cut = state.model.trim_by_plane([0,0,1], botz).project()
+        bounds2 = state.material.trim_by_plane([0,0,1], botz+2e-8).project()
+        bounds = safe_offset(bounds2, (0.5*state.tool.diameter)*(1-3*sf))
+        cut = state.model.trim_by_plane([0,0,1], botz+2e-8).project()
 
-        plt.figure()
-        plt.xlim(-0.05, 0.05)
-        plt.ylim(-0.05, 0.05)
-        plt.gca().set_aspect('equal', adjustable='box')
-        for poly in cut.to_polygons():
-            plt.plot([pt[0] for pt in poly], [pt[1] for pt in poly], "r-")
-        for poly in bounds.to_polygons():
-            plt.plot([pt[0] for pt in poly], [pt[1] for pt in poly], "b-")
+        #plt.figure()
+        #plt.xlim(-0.05, 0.05)
+        #plt.ylim(-0.05, 0.05)
+        #plt.gca().set_aspect('equal', adjustable='box')
+        #for poly in cut.to_polygons():
+        #    plt.plot([pt[0] for pt in poly], [pt[1] for pt in poly], "r-")
+        #for poly in bounds.to_polygons():
+        #    plt.plot([pt[0] for pt in poly], [pt[1] for pt in poly], "b-")
         cut = safe_offset(cut, stock)
 
         # offset outline until no operations remain
         cncpaths = []
-        paths, cncpath = process(safe_offset(cut, 0.5*state.tool.diameter) if not cut.is_empty() else CrossSection.circle(0.4*state.tool.diameter), bounds, climb)
-        cncpaths.append(cncpath)
-        while not (bounds - paths).is_empty():
-            paths, cncpath = process(safe_offset(paths, 0.5*state.tool.diameter), bounds, climb)
-            if len(cncpath) == 0:
-                break
+        
+        if cut.is_empty():
+            paths, cncpath = process(bounds2, bounds, climb)
+            while not len(cncpath) == 0:
+                cncpaths.insert(0, cncpath[::-1])
+                paths, cncpath = process(safe_offset(paths, -0.5*state.tool.diameter), bounds, climb)
+        else:
+            paths, cncpath = process(safe_offset(cut, 0.5*state.tool.diameter), bounds, climb)
             cncpaths.append(cncpath)
+            while not (bounds - paths).is_empty():
+                paths, cncpath = process(safe_offset(paths, 0.5*state.tool.diameter), bounds, climb)
+                if len(cncpath) == 0:
+                    break
+                cncpaths.append(cncpath)
         
         # map paths to which paths need to be cut first
         descendants = [[[] for _ in range(len(layer))] for layer in cncpaths]
         for descarr, prevlayer, layer in zip(descendants, cncpaths[:-1], cncpaths[1:]):
-            for pathi, path in enumerate(layer):
-                mintotaldist, pathidx = 1e309, -1
-                for i, otherpath in enumerate(prevlayer):
-                    totaldist = sum(np.linalg.norm(point-otherpath, ord=2, axis=1).min() for point in path)
-                    if totaldist < mintotaldist:
-                        mintotaldist, pathidx = totaldist, i
-                if pathidx != -1:
-                    descarr[pathidx].append(pathi)
+            coords = np.concatenate([path for path in layer])
+            idxs = [pathi for pathi in range(len(layer)) for _ in layer[pathi]]
+            tree = KDTree(coords)
+            for i, otherpath in enumerate(prevlayer):
+                neighbors = tree.query_ball_point(otherpath, 0.51*state.tool.diameter)
+                for k in set(idxs[i] for n in neighbors for i in n):
+                    descarr[i].append(k)
+        #print(descendants)
         active = [(i,j) for i in range(len(cncpaths)) for j in range(len(cncpaths[i])) if len(descendants[i][j]) == 0]
         process_arr = []
 
@@ -358,14 +422,27 @@ class RoughCut(Operation):
                     arr.remove(j)
                     if len(arr) == 0:
                         active.append((i-1, nj))
-        for path in process_arr:
-            plt.plot(path[:,0], path[:,1], "g-")
-            plt.plot(path[0,0], path[0,1], "g+")
-        for pp, xp in zip(process_arr[:-1], process_arr[1:]):
-            plt.plot([pp[-1,0], xp[0,0]], [pp[-1,1], xp[0,1]], "g--")
-        segs = [arcify_path(path, 0, len(path)) for path in process_arr]
+        #for path in process_arr:
+        #    plt.plot(path[:,0], path[:,1], "k-")
+        #    plt.plot(path[0,0], path[0,1], "k+")
+        #for pp, xp in zip(process_arr[:-1], process_arr[1:]):
+        #    plt.plot([pp[-1,0], xp[0,0]], [pp[-1,1], xp[0,1]], "k--")
+        
+        #segs = [arcify_path(path) for path in process_arr]
+        segs = pool.map(arcify_path, process_arr)
+        #for path in segs:
+        #    for seg in path:
+        #        if seg[0] == 1:
+        #            plt.plot([seg[1][0], seg[2][0]], [seg[1][1], seg[2][1]], "b-")
+        #        elif seg[0] == 2:
+        #            plt.plot([seg[1][0], seg[3][0]], [seg[1][1], seg[3][1]], "r-")
+        #            plt.plot([seg[2][0], seg[3][0]], [seg[2][1], seg[3][1]], "r-")
+        #        elif seg[0] == 3:
+        #            plt.plot([seg[1][0], seg[3][0]], [seg[1][1], seg[3][1]], "g-")
+        #            plt.plot([seg[2][0], seg[3][0]], [seg[2][1], seg[3][1]], "g-")
+        #print(segs)
 
-        plt.show()
+        #plt.show()
         return segs
 
     def execute(self, state):
@@ -379,49 +456,43 @@ class RoughCut(Operation):
             cutz = botz
             while cutz is not None:
                 slice_path = RoughCut.path_stacks(state, cutz+self.stock, stock=self.stock)
-                for path in slice_path:
-                    yield from LinearInterpolate([path[0][1][0],path[0][1][1],None]).execute(state)
+                for pi,path in enumerate(slice_path):
+                    yield from LinearInterpolate([path[0][1][0],path[0][1][1],None], fast=True).execute(state)
                     yield from LinearInterpolate([None,None,cutz+self.stock]).execute(state)
                     for seg in path:
                         if seg[0] == 1:
                             yield from LinearInterpolate([seg[2][0],seg[2][1],None]).execute(state)
                         else:
                             yield from CircularInterpolate([seg[2][0],seg[2][1],None], seg[3], seg[0]).execute(state)
-                    yield from LinearInterpolate([None,None,50e-3]).execute(state)
+                    if pi < len(slice_path)-1:
+                        endpt = path[-1][2]
+                        nextstart = slice_path[pi+1][0][1]
+                        highest = (state.material ^ state.tool.generate_linear_cutarea(np.pad(endpt, (0,1), 'constant'), np.pad(nextstart, (0,1), 'constant'))).bounding_box()[5]+2e-3
+                        yield from LinearInterpolate([None,None,highest], fast=True).execute(state)
+                    else:
+                        yield from LinearInterpolate([None,None,state.material.bounding_box()[5]+2e-3], fast=True).execute(state)
                 cutz = find_topzstop(state.model, botz+self.stock, botz+self.stepz+self.stock) if abs(cutz-botz)<1e-9 else find_topzstop(state.model, botz+self.stock, cutz)
     
     def __str__(self):
         return f"Rough cut from {self.endz} steps of {self.stepz} with {self.stock} stock"
 
-operations = []
-opcodes = []
-operationid = 0
-subiter = None
-subid = 0
-
-tooldia = 4
-rotangle = 90
-lx, ly, lz = 0, 0, 50
-cx, cy, cz = True, True, True
-tz, sz = 8.5, 4
-play = False
-lvs = 0.1
-
 def polyscope_callback():
-    global operations, opcodes, operationid, subiter, subid, tooldia, rotangle, state, lx, ly, lz, cx, cy, cz, tz, sz, play, lvs
+    global operations, opcodes, operationid, subiter, subid, tooldia, rotangle, state, lx, ly, lz, cx, cy, cz, tz, sz, play, lvs, teeth, fpt
 
     if (psim.TreeNode("Change Tool")):
         changed, tooldia = psim.InputFloat("Diameter [mm]", tooldia) 
+        changed, teeth = psim.InputFloat("Teeth []", teeth) 
+        changed, fpt = psim.InputFloat("Feed per tooth [mm]", fpt) 
         psim.TextUnformatted("Tool Type")
         psim.SameLine()
         if(psim.Button("End Mill")):
-            operations.append((ToolChange(Tool("endmill", tooldia*1e-3, 50e-3)), []))
+            operations.append((ToolChange(Tool("endmill", tooldia*1e-3, 50e-3, teeth, fpt)), []))
         psim.SameLine()
         if(psim.Button("Ball Nose")):
-            operations.append((ToolChange(Tool("ballnose", tooldia*1e-3, 50e-3)), []))
+            operations.append((ToolChange(Tool("ballnose", tooldia*1e-3, 50e-3, teeth, fpt)), []))
         psim.SameLine()
         if(psim.Button("Drill")):
-            operations.append((ToolChange(Tool("drill", tooldia*1e-3, 50e-3)), []))
+            operations.append((ToolChange(Tool("drill", tooldia*1e-3, 50e-3, teeth, fpt)), []))
         psim.TreePop()
     
     if (psim.TreeNode("Rotate Workpiece")):
@@ -474,7 +545,7 @@ def polyscope_callback():
         else:
             subiter = None
         state = operations[operationid][0].restore()
-        operations[operationid][1] = []
+        operations[operationid][1].clear()
         lx, ly, lz = state.loc*1e3
         state.refresh_polyscape()
 
@@ -504,13 +575,38 @@ def polyscope_callback():
         state.refresh_polyscape()
     
     psim.ListBox("Operations", operationid, [str(o[0]) for o in operations])
-    gcodes = [desc for o in operations for desc in o[1]]
+    gcodes = [f"G0 G90.1 G54 G17 G40 G49 G80\nS{rpm} M3"] + [desc for o in operations for desc in o[1]] + ["M30"]
     psim.ListBox("G-code", len(gcodes)-1, gcodes)
+    if psim.Button("SAVE GCODE"):
+        with open("gcode.nc", "w") as f:
+            f.write("\n".join(gcodes))
 
-    
+if __name__ == "__main__":
+    pool = Pool()
+    cs = 32
+    rpm = 10000
+    set_circular_segments(cs)
+    sf = 1-np.cos(np.pi/cs)
+    #print(3*sf)
+    Manifold.__deepcopy__ = lambda self, memo: Manifold.compose([self])
 
-model_file = 'ledmain.obj'
-blank_size = np.array([75e-3, 25e-3, 50e-3])
-state = State.generate(model_file, blank_size)
-state.loc = np.array([0, 0, 50e-3])
-state.init_polyscope()
+    operations = []
+    opcodes = []
+    operationid = 0
+    subiter = None
+    subid = 0
+
+    tooldia = 4
+    rotangle = 90
+    lx, ly, lz = 0, 0, 50
+    cx, cy, cz = True, True, True
+    tz, sz = 8.5, 4
+    play = False
+    lvs = 0.1
+    teeth, fpt = 2.0, 0.025
+
+    model_file = 'ledmain.obj'
+    blank_size = np.array([75e-3, 25e-3, 50e-3])
+    state = State.generate(model_file, blank_size)
+    state.loc = np.array([0, 0, 50e-3])
+    state.init_polyscope()
