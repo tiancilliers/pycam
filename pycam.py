@@ -422,27 +422,27 @@ class RoughCut(Operation):
                     arr.remove(j)
                     if len(arr) == 0:
                         active.append((i-1, nj))
-        #for path in process_arr:
-        #    plt.plot(path[:,0], path[:,1], "k-")
-        #    plt.plot(path[0,0], path[0,1], "k+")
-        #for pp, xp in zip(process_arr[:-1], process_arr[1:]):
-        #    plt.plot([pp[-1,0], xp[0,0]], [pp[-1,1], xp[0,1]], "k--")
+        for path in process_arr:
+            plt.plot(path[:,0], path[:,1], "k-")
+            plt.plot(path[0,0], path[0,1], "k+")
+        for pp, xp in zip(process_arr[:-1], process_arr[1:]):
+            plt.plot([pp[-1,0], xp[0,0]], [pp[-1,1], xp[0,1]], "k--")
         
         #segs = [arcify_path(path) for path in process_arr]
         segs = pool.map(arcify_path, process_arr)
-        #for path in segs:
-        #    for seg in path:
-        #        if seg[0] == 1:
-        #            plt.plot([seg[1][0], seg[2][0]], [seg[1][1], seg[2][1]], "b-")
-        #        elif seg[0] == 2:
-        #            plt.plot([seg[1][0], seg[3][0]], [seg[1][1], seg[3][1]], "r-")
-        #            plt.plot([seg[2][0], seg[3][0]], [seg[2][1], seg[3][1]], "r-")
-        #        elif seg[0] == 3:
-        #            plt.plot([seg[1][0], seg[3][0]], [seg[1][1], seg[3][1]], "g-")
-        #            plt.plot([seg[2][0], seg[3][0]], [seg[2][1], seg[3][1]], "g-")
+        for path in segs:
+            for seg in path:
+                if seg[0] == 1:
+                    plt.plot([seg[1][0], seg[2][0]], [seg[1][1], seg[2][1]], "b-")
+                elif seg[0] == 2:
+                    plt.plot([seg[1][0], seg[3][0]], [seg[1][1], seg[3][1]], "r-")
+                    plt.plot([seg[2][0], seg[3][0]], [seg[2][1], seg[3][1]], "r-")
+                elif seg[0] == 3:
+                    plt.plot([seg[1][0], seg[3][0]], [seg[1][1], seg[3][1]], "g-")
+                    plt.plot([seg[2][0], seg[3][0]], [seg[2][1], seg[3][1]], "g-")
         #print(segs)
 
-        #plt.show()
+        plt.show()
         return segs
 
     def execute(self, state):
