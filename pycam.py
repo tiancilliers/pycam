@@ -265,6 +265,8 @@ class RotateWorkpiece(Operation):
         return f"Rotate {self.rotangle} degrees"	
 
 def safe_offset(crosssec, delta, sign=1):
+    if abs(delta) < 1e-8:
+        return crosssec.simplify()
     fixed_polys = []
     for comp in crosssec.decompose():
         polys = crosssec.to_polygons()
@@ -292,7 +294,17 @@ def process(paths, bounds, climb=True):
 
     return paths ^ bounds, openPathsC
 
-def arcify_path(path):
+def arcify_path(patho):
+    path2, face = patho
+    if not face:
+        path = path2
+    else:
+        tree = KDTree(np.array(path2[:,:2]))
+        path = []
+        for vi, vert in enumerate(path2):
+            if len([v for v in tree.query_ball_point(vert[:2], 1e-5) if v < vi]) == 0:
+                path.append(vert)
+        path = np.array(path)
     segs = []
     ii = 0
     jj = 4
@@ -308,11 +320,14 @@ def arcify_path(path):
             maxerr = np.max(np.abs(np.linalg.norm(patharr[1:-1]-p, axis=1)-r))
             circ = np.sum(np.linalg.norm(patharr[1:]-patharr[:-1], axis=1))
             maxerr = max(maxerr, np.max(np.abs(np.linalg.norm(0.5*patharr[1:]+0.5*patharr[:-1]-p, axis=1)-r)))
-            if maxerr < 2e-5:
+            cont = all(np.cross(patharr[:-2]-p, patharr[1:-1]-p)*np.cross(patharr[1:-1]-p, patharr[2:]-p) >= 0)
+            if maxerr < 2e-5 and cont:
                 if circ/r > 2*np.pi/64:
                     segs.append((jj-ii, ii, p))
                 jj += 1
             else:
+                if jj-ii > 4:
+                    jj -= 1
                 ii += 1
         else:
             jj += 1
@@ -320,7 +335,7 @@ def arcify_path(path):
     segs2 = []
     for seg in sorted(segs, key=lambda x: x[0], reverse=True):
         if not used.get_sum(seg[1], seg[1]+seg[0]):
-            for k in range(seg[1]+1, seg[1]+seg[0]-1):
+            for k in range(seg[1], seg[1]+seg[0]):
                 used.update(k, True)
             segs2.append(seg)   
     segs3 = []
@@ -357,7 +372,7 @@ def find_topzstop(model, minz, maxz):
     for pt in pts:
         if not any(abs(zstop-pt[0]) < 1e-9 for zstop in zstops):
             zstops.append(pt[0])
-    zstops = sorted(zstops)[::-1]
+    zstops = sorted(zstops)#[::-1]
     return zstops[0] if len(zstops) > 0 else None
 
 class RoughCut(Operation):
@@ -397,7 +412,6 @@ class RoughCut(Operation):
                 if len(cncpath) == 0:
                     break
                 cncpaths.append(cncpath)
-        
         # map paths to which paths need to be cut first
         descendants = [[[] for _ in range(len(layer))] for layer in cncpaths]
         for descarr, prevlayer, layer in zip(descendants, cncpaths[:-1], cncpaths[1:]):
@@ -411,7 +425,6 @@ class RoughCut(Operation):
         #print(descendants)
         active = [(i,j) for i in range(len(cncpaths)) for j in range(len(cncpaths[i])) if len(descendants[i][j]) == 0]
         process_arr = []
-
         # sort paths to minimize travel distance
         while len(active) > 0:
             minidx = 0 if len(process_arr) == 0 else min(range(len(active)), key=lambda x: np.linalg.norm(process_arr[-1][-1,:]-cncpaths[active[x][0]][active[x][1]][0,:]))
@@ -422,14 +435,16 @@ class RoughCut(Operation):
                     arr.remove(j)
                     if len(arr) == 0:
                         active.append((i-1, nj))
-        for path in process_arr:
-            plt.plot(path[:,0], path[:,1], "k-")
-            plt.plot(path[0,0], path[0,1], "k+")
-        for pp, xp in zip(process_arr[:-1], process_arr[1:]):
-            plt.plot([pp[-1,0], xp[0,0]], [pp[-1,1], xp[0,1]], "k--")
+        #for path in process_arr:
+            #plt.plot(path[:,0], path[:,1], "k-+")
+            #plt.plot(path[0,0], path[0,1], "k+")
+        #for pp, xp in zip(process_arr[:-1], process_arr[1:]):
+            #plt.plot([pp[-1,0], xp[0,0]], [pp[-1,1], xp[0,1]], "k--")
         
-        #segs = [arcify_path(path) for path in process_arr]
-        segs = pool.map(arcify_path, process_arr)
+        process_arr = [(path, cut.is_empty()) for path in process_arr]
+        segs = [arcify_path(path) for path in process_arr]
+        #segs = pool.map(arcify_path, process_arr)
+        segs = [seg for seg in segs if len(seg) > 0]
         for path in segs:
             for seg in path:
                 if seg[0] == 1:
@@ -442,7 +457,7 @@ class RoughCut(Operation):
                     plt.plot([seg[2][0], seg[3][0]], [seg[2][1], seg[3][1]], "g-")
         #print(segs)
 
-        plt.show()
+        #plt.show()
         return segs
 
     def execute(self, state):
@@ -467,11 +482,13 @@ class RoughCut(Operation):
                     if pi < len(slice_path)-1:
                         endpt = path[-1][2]
                         nextstart = slice_path[pi+1][0][1]
-                        highest = (state.material ^ state.tool.generate_linear_cutarea(np.pad(endpt, (0,1), 'constant'), np.pad(nextstart, (0,1), 'constant'))).bounding_box()[5]+2e-3
+                        highest = (state.material ^ state.tool.generate_linear_cutarea(np.concatenate((endpt, [cutz+self.stock])), np.concatenate((nextstart, [cutz+self.stock])))).bounding_box()[5]+2e-3
+                        if highest < -1e10:
+                            highest = cutz + self.stepz + 2e-3
                         yield from LinearInterpolate([None,None,highest], fast=True).execute(state)
                     else:
                         yield from LinearInterpolate([None,None,state.material.bounding_box()[5]+2e-3], fast=True).execute(state)
-                cutz = find_topzstop(state.model, botz+self.stock, botz+self.stepz+self.stock) if abs(cutz-botz)<1e-9 else find_topzstop(state.model, botz+self.stock, cutz)
+                cutz = find_topzstop(state.model, botz+self.stock, botz+self.stepz+self.stock) if abs(cutz-botz)<1e-9 else find_topzstop(state.model, cutz+self.stock, botz+self.stepz+self.stock)
     
     def __str__(self):
         return f"Rough cut from {self.endz} steps of {self.stepz} with {self.stock} stock"
