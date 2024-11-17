@@ -18,8 +18,7 @@ from multiprocessing import Pool
 # - detect arcs and interpolate                     DONE
 # - detect heights for moving between operations    DONE
 # - leadin
-# - ballnose
-# - pick faces to go to
+# - ballnose                                        PARTIALLY DONE
 # - custom feedrates                                DONE
 # - violation detection
 # - pick holes, flatten
@@ -95,40 +94,23 @@ class Tool:
         phi = math.atan2(delta[0], delta[1])+np.pi
         theta = math.atan2(dxy, delta[2])
 
-        cutarea = Manifold()
-        if dxy > 1e-9:
-            rectrod = CrossSection.square([self.diameter, (self.length-dcyl)*np.sin(theta)]).translate([-0.5*self.diameter, 0])
-            cutarea += Manifold.extrude(rectrod, dxyz)\
-                .warp(lambda v: [v[0], v[1], v[2]+v[1]/math.tan(theta)])\
-                .rotate(np.array([np.rad2deg(theta), 0, 0]))\
-                .translate([0,0,dcyl])
-        if abs(delta[2]) > 1e-9:
-            circ = CrossSection.circle(0.5*self.diameter)
-            cutarea += Manifold.extrude(circ, 1).scale([1,1,delta[2]])\
-                .warp(lambda v: [v[0], v[1]-v[2]*math.tan(theta), v[2]])\
-                .translate([0,0,dcyl])
-        cutarea += Manifold.cylinder(self.length-dcyl, 0.5*self.diameter).rotate([0, 0, np.degrees(phi)]).translate([0,0,dcyl])
-        cutarea += Manifold.cylinder(self.length-dcyl, 0.5*self.diameter).rotate([0, 0, np.degrees(phi)]).translate([0,-dxy,delta[2]+dcyl])
-        if self.type == "ballnose":
-            circ = CrossSection.circle(0.5*self.diameter)
-            cutarea += Manifold.extrude(circ, dxyz)\
-                .rotate(np.array([np.rad2deg(theta), 0, 0]))\
-                .translate([0,0,dcyl])
-            if dxy > 1e-9:
-                cutarea += Manifold.revolve(circ, circular_segments=int(16*(np.pi-theta)/np.pi)+1, revolve_degrees=np.degrees(np.pi-theta))\
-                    .rotate(np.array([-90, 0., 90]))\
-                    .translate([0,0,dcyl])
-                cutarea += Manifold.revolve(circ, circular_segments=int(16*(theta)/np.pi)+1, revolve_degrees=np.degrees(theta))\
-                    .rotate(np.array([-90, 0., -90]))\
-                    .translate([0,-dxy,dcyl+delta[2]])
-            else:
-                cutarea += Manifold.sphere(0.5*self.diameter).translate([0,0,dcyl])
-        if self.type == "drill":
-            raise NotImplementedError("Drill not implemented")
+        cuttool = self.generate_bit(np.zeros(3)).rotate(np.array([0, 0, np.rad2deg(phi)])).rotate(np.array([-np.rad2deg(theta), 0, 0]))
 
-        cutarea = cutarea.rotate(np.array([0, 0, -np.rad2deg(phi)])).translate(loc1)
-        #cutarea += self.generate_bit(loc1)
-        #cutarea += self.generate_bit(loc2)
+        verts = cuttool.to_mesh().vert_properties
+        kdtree = KDTree(verts[:,:2])
+
+        projected = cuttool.project()
+
+        def warpfunc(v):
+            # query kdtree
+            idxs = kdtree.query_ball_point(v[:2], 1e-8)
+            z = max(verts[idxs,2]) if v[2] <= 1e-8 else min(verts[idxs,2])+dxyz
+            return [v[0], v[1], z]
+
+        cutarea = Manifold.extrude(projected, 5e-3).warp(warpfunc).rotate(np.array([np.rad2deg(theta),0,0])).rotate(np.array([0, 0, -np.rad2deg(phi)])).translate(loc1)
+
+        cutarea += self.generate_bit(loc1)
+        cutarea += self.generate_bit(loc2)
 
         return cutarea
     
@@ -271,7 +253,7 @@ def safe_offset(crosssec, delta, sign=1):
         return crosssec.simplify()
     fixed_polys = []
     for comp in crosssec.decompose():
-        polys = crosssec.to_polygons()
+        polys = comp.to_polygons()
         for poly in polys:
             n = len(poly)
             number = sum((poly[i%n][0]-poly[(i-1)%n][0])*(poly[i%n][1]+poly[(i-1)%n][1]) for i in range(n))
